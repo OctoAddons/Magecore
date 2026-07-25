@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: MageCore
+## Notes: Mage rotation and buff helper for Turtle WoW
+## Author: Michael
+## Version: 1.5.35
+## SavedVariables: MageCore_Config
+
+MageCore.lua
