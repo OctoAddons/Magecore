@@ -1,16 +1,18 @@
--- MageCore v1.5.83
+-- MageCore v1.5.97
 -- Press-driven mage rotation and self-buff helper for Turtle WoW / Vanilla 1.12.
 
 local _, playerClass = UnitClass("player")
 if playerClass ~= "MAGE" then return end
 
-local VERSION = "1.5.83"
+local VERSION = "1.5.97"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
 
 local spellBookSpells = { "None" }
 local helpfulSpellBookSpells = { "None" }
+local armorSpellBookSpells = { "None" }
+local regularBuffSpellBookSpells = { "None" }
 local knownWaterSpells = {}
 local knownFoodSpells = {}
 local pendingConjure
@@ -18,6 +20,7 @@ local pendingManaAgate
 local conjureRestockActive = {}
 local lastManaAgateBagWarning = -10
 local lastManaAgateSpellWarning = -10
+local lowManaWandFallbackUntil = 0
 local lastCombatSpellAttempt
 local rangeBlockedSpells = {}
 local openerUsedForTarget
@@ -42,6 +45,13 @@ local MAGE_BUFF_NAMES = {
     ["Mage Armor"] = true, ["Molten Armor"] = true,
     ["Mana Shield"] = true, ["Ice Barrier"] = true,
     ["Fire Ward"] = true, ["Frost Ward"] = true
+}
+
+local MAGE_ARMOR_NAMES = {
+    ["Frost Armor"] = true,
+    ["Ice Armor"] = true,
+    ["Mage Armor"] = true,
+    ["Molten Armor"] = true
 }
 
 -- These beneficial spells can be cast on another friendly player. Self-only
@@ -130,6 +140,7 @@ local ATTACK_TEXT_HINTS = {
 }
 
 local rotationIconTexture
+local arcaneExplosionIconTexture
 local buffIconTexture
 local foodStatusText
 local rotationBoxFrame
@@ -144,6 +155,7 @@ local frostNovaNameplates = {}
 local NAMEPLATE_VERTICAL_OFFSET = 24
 local autoRepeatActive = false
 local lastRotationIcon
+local lastArcaneExplosionIcon
 local lastBuffIcon
 
 local function TextureName(texture)
@@ -318,11 +330,19 @@ local function RefreshSpellBook()
     table.sort(helpful)
     spellBookSpells = { "None" }
     helpfulSpellBookSpells = { "None" }
+    armorSpellBookSpells = { "None" }
+    regularBuffSpellBookSpells = { "None" }
     for i = 1, table.getn(learned) do
         table.insert(spellBookSpells, learned[i])
     end
     for i = 1, table.getn(helpful) do
-        table.insert(helpfulSpellBookSpells, helpful[i])
+        local spellName = helpful[i]
+        table.insert(helpfulSpellBookSpells, spellName)
+        if MAGE_ARMOR_NAMES[spellName] then
+            table.insert(armorSpellBookSpells, spellName)
+        else
+            table.insert(regularBuffSpellBookSpells, spellName)
+        end
     end
 
     -- Remove old selections that came from General before this filter existed.
@@ -336,6 +356,11 @@ local function RefreshSpellBook()
             -- Never erase a learned buff merely because classification failed;
             -- that caused the v1.1.8 settings loss on the Vanilla client.
             if buff and buff ~= "None" and not GetSpellBookIndex(buff) then
+                MageCore_Config["Buff" .. i] = "None"
+            elseif i == 1 and buff ~= "None"
+                and not MAGE_ARMOR_NAMES[buff] then
+                MageCore_Config["Buff" .. i] = "None"
+            elseif i > 1 and MAGE_ARMOR_NAMES[buff] then
                 MageCore_Config["Buff" .. i] = "None"
             end
         end
@@ -1453,6 +1478,15 @@ local function LoadDefaults()
     if MageCore_Config.AutoConjureManaAgate == nil then
         MageCore_Config.AutoConjureManaAgate = false
     end
+    if MageCore_Config.AutoDefilersTalisman == nil then
+        MageCore_Config.AutoDefilersTalisman = false
+    end
+    if MageCore_Config.DefilersTalismanHealthLostPercent == nil then
+        MageCore_Config.DefilersTalismanHealthLostPercent = 20
+    end
+    if MageCore_Config.HealingPotionHealthLostPercent == nil then
+        MageCore_Config.HealingPotionHealthLostPercent = 0
+    end
     MageCore_Config.WaterMaximum = math.max(
         tonumber(MageCore_Config.WaterMinimum) or 0,
         tonumber(MageCore_Config.WaterMaximum) or 0
@@ -1469,6 +1503,30 @@ local function LoadDefaults()
                 and MageCore_Config["Buff" .. i] == "Arcane Intellect"
                 or false
         end
+    end
+    if MageCore_Config.BuffArmorLayoutVersion ~= 1 then
+        local armor = "None"
+        local regular = {}
+        for i = 1, 6 do
+            local spellName = MageCore_Config["Buff" .. i]
+            if MAGE_ARMOR_NAMES[spellName] then
+                if armor == "None" then armor = spellName end
+            elseif spellName and spellName ~= "None" then
+                table.insert(regular, {
+                    spell = spellName,
+                    group = MageCore_Config["Buff" .. i .. "Group"]
+                })
+            end
+        end
+        MageCore_Config.Buff1 = armor
+        MageCore_Config.Buff1Group = false
+        for i = 2, 6 do
+            local entry = regular[i - 1]
+            MageCore_Config["Buff" .. i] = entry and entry.spell or "None"
+            MageCore_Config["Buff" .. i .. "Group"] =
+                entry and entry.group or false
+        end
+        MageCore_Config.BuffArmorLayoutVersion = 1
     end
     if MageCore_Config.PvPMode == nil then MageCore_Config.PvPMode = false end
     if MageCore_Config.AutoFireWard == nil then
@@ -1763,7 +1821,7 @@ local function GetArcaneSurgeActionSlotState()
     return nil, nil
 end
 
-local function GetArcaneSurgeAction()
+local function GetArcaneSurgeAction(ignoreRotationConfiguration)
     local usable = GetArcaneSurgeActionSlotState()
     -- Vanilla exposes reactive conditions most reliably through an actual
     -- action-bar spell slot. Combat-log tracking covers characters that keep
@@ -1771,7 +1829,7 @@ local function GetArcaneSurgeAction()
     usable = usable or arcaneSurgeAvailableUntil > GetTime()
     local cooldownRemaining = GetSpellCooldownRemaining("Arcane Surge")
     local manaCost = GetSpellManaCost("Arcane Surge")
-    if not IsArcaneSurgeConfigured()
+    if (not ignoreRotationConfiguration and not IsArcaneSurgeConfigured())
         or not HasLivingEnemyTarget()
         -- GetSpellCooldown alone says Arcane Surge is ready even before a
         -- resist enables it.
@@ -1785,6 +1843,15 @@ local function GetArcaneSurgeAction()
         return nil
     end
     return "Arcane Surge"
+end
+
+local function GetArcaneExplosionButtonAction()
+    local arcaneSurge = GetArcaneSurgeAction(true)
+    if arcaneSurge then return arcaneSurge end
+    if GetSpellBookIndex("Arcane Explosion") then
+        return "Arcane Explosion"
+    end
+    return nil
 end
 
 local function TrackArcaneSurgeFromCombatMessage(message)
@@ -1842,33 +1909,39 @@ local function ClearConfirmedLunaInterrupt(message)
     end
 end
 
-local function HasEnoughManaForSpell(spellName)
+local function SpellIsManaBlocked(spellName)
+    local index = GetSpellBookIndex(spellName)
+    if index and IsUsableSpell then
+        local usable, notEnoughMana =
+            IsUsableSpell(index, BOOKTYPE_SPELL)
+        if notEnoughMana and notEnoughMana ~= 0 then return true end
+    end
     local manaCost = GetSpellManaCost(spellName)
-    return not manaCost or UnitMana("player") >= manaCost
+    return manaCost and UnitMana("player") < manaCost or false
 end
 
-local function GetLowestRotationManaCost()
-    local lowest
+local function HasEnoughManaForSpell(spellName)
+    return not SpellIsManaBlocked(spellName)
+end
+
+local function AllConfiguredRotationSpellsNeedMana()
+    local foundSpell = false
     local i
     for i = 1, 6 do
         local spellName = MageCore_Config["Rotation" .. i]
         if spellName and spellName ~= "None" and spellName ~= "Shoot"
             and GetSpellBookIndex(spellName) then
-            local manaCost = GetSpellManaCost(spellName)
-            if manaCost and manaCost > 0
-                and (not lowest or manaCost < lowest) then
-                lowest = manaCost
-            end
+            foundSpell = true
+            if not SpellIsManaBlocked(spellName) then return false end
         end
     end
-    return lowest
+    return foundSpell
 end
 
 local function GetLowManaWandAction()
     if not HasLivingEnemyTarget() then return nil end
-    local lowestManaCost = GetLowestRotationManaCost()
-    if not lowestManaCost
-        or UnitMana("player") >= lowestManaCost then
+    if not AllConfiguredRotationSpellsNeedMana()
+        and GetTime() >= lowManaWandFallbackUntil then
         return nil
     end
 
@@ -2268,6 +2341,171 @@ function MageCore_IceBlock()
     CastSpellByName("Ice Block")
 end
 
+function MageCore_ArcaneExplosion()
+    LoadDefaults()
+
+    -- Preserve protected channels, but allow this button to consume a Surge
+    -- proc that appears during Arcane Missiles.
+    if channelInProgress then
+        local arcaneSurge = channelSpellName == "Arcane Missiles"
+            and GetArcaneSurgeAction(true)
+        if arcaneSurge then
+            SpellStopCasting()
+            arcaneSurgeAvailableUntil = 0
+            lastCombatSpellAttempt = {
+                spell = arcaneSurge,
+                target = GetTargetKey(),
+                time = GetTime()
+            }
+            CastSpellByName(arcaneSurge)
+        end
+        return
+    end
+
+    if MageCore_TryHealingPotion and MageCore_TryHealingPotion() then
+        return
+    end
+    if MageCore_TryManaAgate and MageCore_TryManaAgate() then
+        return
+    end
+    if MageCore_TryDefilersTalisman
+        and MageCore_TryDefilersTalisman() then
+        return
+    end
+
+    local spellName = GetArcaneExplosionButtonAction()
+    if not spellName then return end
+    if spellName == "Arcane Surge" then
+        arcaneSurgeAvailableUntil = 0
+    end
+    lastCombatSpellAttempt = {
+        spell = spellName,
+        target = GetTargetKey(),
+        time = GetTime()
+    }
+    CastSpellByName(spellName)
+end
+
+function MageCore_TryDefilersTalisman()
+    local maximumHealth = UnitHealthMax("player")
+    local healthLost = maximumHealth - UnitHealth("player")
+    local thresholdPercent = tonumber(
+        MageCore_Config
+            and MageCore_Config.DefilersTalismanHealthLostPercent) or 20
+    if not MageCore_Config
+        or not MageCore_Config.AutoDefilersTalisman
+        or maximumHealth <= 0
+        or healthLost * 100 < maximumHealth * thresholdPercent then
+        return false
+    end
+
+    local slot
+    for slot = 13, 14 do
+        local link = GetInventoryItemLink("player", slot)
+        if link and string.find(link, "Defiler's Talisman", 1, true) then
+            local start, duration, enabled =
+                GetInventoryItemCooldown("player", slot)
+            local ready = not start or not duration
+                or start == 0 or duration == 0
+                or start + duration <= GetTime()
+            if ready and (enabled == nil or enabled ~= 0) then
+                UseInventoryItem(slot)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function MageCore_TryManaAgate()
+    if not MageCore_Config
+        or not MageCore_Config.AutoConjureManaAgate
+        or UnitMana("player") > 200 then
+        return false
+    end
+
+    local bag, slot = FindBagItemByName("Mana Agate")
+    if not bag then return false end
+
+    local start, duration = GetContainerItemCooldown(bag, slot)
+    local ready = not start or not duration
+        or start == 0 or duration == 0
+        or start + duration <= GetTime()
+    if not ready then return false end
+
+    UseContainerItem(bag, slot)
+    return true
+end
+
+function MageCore_TryHealingPotion()
+    local thresholdPercent = tonumber(
+        MageCore_Config
+            and MageCore_Config.HealingPotionHealthLostPercent) or 0
+    local maximumHealth = UnitHealthMax("player")
+    local currentHealth = UnitHealth("player")
+    if thresholdPercent <= 0
+        or maximumHealth <= 0
+        or currentHealth * 100 > maximumHealth * thresholdPercent then
+        return false
+    end
+
+    local bestBag
+    local bestSlot
+    local bestItemLevel = -1
+    local inBattleground = false
+    if IsInInstance then
+        local _, instanceType = IsInInstance()
+        inBattleground = instanceType == "pvp"
+    end
+    if not inBattleground and GetBattlefieldStatus then
+        local queueIndex
+        for queueIndex = 1, 3 do
+            if GetBattlefieldStatus(queueIndex) == "active" then
+                inBattleground = true
+                break
+            end
+        end
+    end
+
+    local bag, slot
+    for bag = 0, 4 do
+        for slot = 1, GetContainerNumSlots(bag) do
+            local link = GetContainerItemLink(bag, slot)
+            local _, _, itemName = string.find(link or "", "%[(.-)%]")
+            local lowerName = itemName and string.lower(itemName)
+            local isHealingPotion = lowerName and string.find(
+                lowerName, "healing potion", 1, true)
+            local isHealingDraught = lowerName and string.find(
+                lowerName, "healing draught", 1, true)
+            if isHealingPotion or (isHealingDraught and inBattleground) then
+                local start, duration =
+                    GetContainerItemCooldown(bag, slot)
+                local ready = not start or not duration
+                    or start == 0 or duration == 0
+                    or start + duration <= GetTime()
+                if ready then
+                    local itemLevel = 0
+                    if GetItemInfo then
+                        local _, _, _, foundItemLevel = GetItemInfo(link)
+                        itemLevel = tonumber(foundItemLevel) or 0
+                    end
+                    if not bestBag or itemLevel > bestItemLevel then
+                        bestBag = bag
+                        bestSlot = slot
+                        bestItemLevel = itemLevel
+                    end
+                end
+            end
+        end
+    end
+
+    if bestBag then
+        UseContainerItem(bestBag, bestSlot)
+        return true
+    end
+    return false
+end
+
 function MageCore_Rotate()
     LoadDefaults()
     -- A short Arcane Surge proc may appear during an Arcane Missiles tick.
@@ -2288,6 +2526,9 @@ function MageCore_Rotate()
         end
         return
     end
+    if MageCore_TryHealingPotion() then return end
+    if MageCore_TryManaAgate() then return end
+    if MageCore_TryDefilersTalisman() then return end
     -- Learn the enemy's Fire threat even when Counterspell wins this press.
     local frostWard = GetFrostWardAction()
     local fireWard = GetFireWardAction()
@@ -2463,6 +2704,18 @@ local function ShowRotationButtonTooltip(button)
     GameTooltip:Show()
 end
 
+local function ShowArcaneExplosionButtonTooltip(button)
+    local spellName = GetArcaneExplosionButtonAction()
+    local spellIndex = spellName and GetSpellBookIndex(spellName)
+    GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+    if spellIndex then
+        GameTooltip:SetSpell(spellIndex, BOOKTYPE_SPELL)
+    else
+        GameTooltip:AddLine("MageCore Arcane Explosion")
+    end
+    GameTooltip:Show()
+end
+
 local function HookRotationButtonTooltip(button)
     if button.mageCoreTooltipHooked then return end
     button.mageCoreTooltipHooked = true
@@ -2472,6 +2725,8 @@ local function HookRotationButtonTooltip(button)
         local actionSlot = ActionButton_GetPagedID(this)
         if actionSlot and GetActionText(actionSlot) == "MageRot" then
             ShowRotationButtonTooltip(this)
+        elseif actionSlot and GetActionText(actionSlot) == "MageAoE" then
+            ShowArcaneExplosionButtonTooltip(this)
         end
     end)
 end
@@ -2527,6 +2782,25 @@ local function UpdateIceBlockCooldown()
     end
 end
 
+local function UpdateArcaneExplosionCooldown(spellName)
+    local start, duration, enabled = 0, 0, 0
+    if spellName then
+        start, duration, enabled = GetSpellCooldownInfo(spellName)
+        if start == nil then start, duration, enabled = 0, 0, 0 end
+    end
+
+    local _, button
+    for _, button in ipairs(GetActionButtons()) do
+        local actionSlot = ActionButton_GetPagedID(button)
+        if actionSlot and GetActionText(actionSlot) == "MageAoE" then
+            local cooldown = GetActionButtonCooldown(button)
+            if cooldown then
+                CooldownFrame_SetTimer(cooldown, start, duration, enabled)
+            end
+        end
+    end
+end
+
 local function UpdateRotationManaState(spellName)
     local manaCost = GetSpellManaCost(spellName)
     local insufficient = manaCost and UnitMana("player") < manaCost
@@ -2551,6 +2825,49 @@ local function UpdateRotationManaState(spellName)
     end
 end
 
+local function UpdateArcaneExplosionManaState(spellName)
+    local manaCost = GetSpellManaCost(spellName)
+    local insufficient = manaCost and UnitMana("player") < manaCost
+    local red, green, blue = 1, 1, 1
+    if insufficient then red, green, blue = 0.4, 0.4, 0.4 end
+
+    if arcaneExplosionIconTexture then
+        arcaneExplosionIconTexture:SetVertexColor(red, green, blue)
+    end
+    local _, button
+    for _, button in ipairs(GetActionButtons()) do
+        local actionSlot = ActionButton_GetPagedID(button)
+        if actionSlot and GetActionText(actionSlot) == "MageAoE" then
+            local icon = getglobal(button:GetName() .. "Icon")
+            if icon then icon:SetVertexColor(red, green, blue) end
+        end
+    end
+end
+
+-- This remains outside the main OnUpdate closure for Vanilla Lua's 32-upvalue
+-- limit. The event handler calls it as a global and captures no new locals.
+function MageCore_UpdateArcaneExplosionButton()
+    local spellName = GetArcaneExplosionButtonAction()
+    local texture = GetSpellTextureByName(spellName)
+        or ICON_PATH .. "Spell_Nature_WispSplode"
+    if arcaneExplosionIconTexture then
+        arcaneExplosionIconTexture:SetTexture(texture)
+    end
+
+    local macroIcon = TextureName(texture) or "Spell_Nature_WispSplode"
+    if macroIcon ~= lastArcaneExplosionIcon then
+        local index = GetMacroIndex("MageAoE", false)
+        if index > 0 then
+            EditMacro(
+                index, "MageAoE", macroIcon,
+                "/script MageCore_ArcaneExplosion()", nil, nil)
+        end
+        lastArcaneExplosionIcon = macroIcon
+    end
+    UpdateArcaneExplosionCooldown(spellName)
+    UpdateArcaneExplosionManaState(spellName)
+end
+
 local function StyleButton(button)
     button:SetBackdrop({
         bgFile = "Interface\\Buttons\\WHITE8X8",
@@ -2560,6 +2877,212 @@ local function StyleButton(button)
     })
     button:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
     button:SetBackdropBorderColor(0.25, 0.65, 0.9, 1)
+end
+
+-- Keep this builder outside MageCore_CreateMenu. Vanilla Lua limits each
+-- function to 32 upvalues, and that large menu function is already at the
+-- client limit.
+function MageCore_CreateArcaneExplosionDragButton(rotationPanel)
+    local dragArcaneExplosion = CreateFrame("Button", nil, rotationPanel)
+    dragArcaneExplosion:SetWidth(48)
+    dragArcaneExplosion:SetHeight(48)
+    dragArcaneExplosion:SetPoint("TOPLEFT", 160, -272)
+    StyleButton(dragArcaneExplosion)
+    arcaneExplosionIconTexture =
+        dragArcaneExplosion:CreateTexture(nil, "OVERLAY")
+    arcaneExplosionIconTexture:SetPoint("TOPLEFT", 4, -4)
+    arcaneExplosionIconTexture:SetPoint("BOTTOMRIGHT", -4, 4)
+    arcaneExplosionIconTexture:SetTexture(
+        GetSpellTextureByName(GetArcaneExplosionButtonAction())
+            or ICON_PATH .. "Spell_Nature_WispSplode")
+    dragArcaneExplosion:RegisterForDrag("LeftButton")
+    dragArcaneExplosion:SetScript("OnDragStart", function()
+        local index = CreateOrUpdateMacro(
+            "MageAoE", "/script MageCore_ArcaneExplosion()",
+            GetArcaneExplosionButtonAction())
+        if index and index > 0 then PickupMacro(index) end
+    end)
+    dragArcaneExplosion:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Arcane Explosion / Surge")
+        GameTooltip:AddLine(
+            "Casts Arcane Explosion normally.", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine(
+            "When Arcane Surge procs, this same button casts Surge instead.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:AddLine(
+            "Drag onto an action bar.", 0.8, 0.8, 0.8)
+        GameTooltip:Show()
+    end)
+    dragArcaneExplosion:SetScript(
+        "OnLeave", function() GameTooltip:Hide() end)
+    local arcaneExplosionLabel = rotationPanel:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    arcaneExplosionLabel:SetPoint(
+        "BOTTOM", dragArcaneExplosion, "TOP", 0, 2)
+    arcaneExplosionLabel:SetText("Arcane Explosion")
+end
+
+-- Kept outside MageCore_CreateMenu to avoid increasing that function's
+-- upvalue count on Vanilla Lua.
+function MageCore_CreateDefilersTalismanButton(consumablePanel)
+    local button = CreateFrame("Button", nil, consumablePanel)
+    button:SetWidth(190)
+    button:SetHeight(32)
+    button:SetPoint("TOPLEFT", 18, -160)
+    StyleButton(button)
+
+    local label = button:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    label:SetPoint("CENTER", 0, 0)
+    local function UpdateText()
+        label:SetText(
+            "Defiler's Talisman: "
+                .. (MageCore_Config.AutoDefilersTalisman
+                    and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
+    end
+    UpdateText()
+
+    button:SetScript("OnClick", function()
+        MageCore_Config.AutoDefilersTalisman =
+            not MageCore_Config.AutoDefilersTalisman
+        UpdateText()
+    end)
+    button:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Defiler's Talisman")
+        GameTooltip:AddLine(
+            "Rotation uses the equipped trinket after you have lost the selected percentage of your maximum health.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:AddLine(
+            "It must be equipped in either trinket slot and off cooldown.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:Show()
+    end)
+    button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local slider = CreateFrame(
+        "Slider", "MageCoreDefilersHealthSlider",
+        consumablePanel, "OptionsSliderTemplate")
+    slider:SetWidth(250)
+    slider:SetHeight(16)
+    slider:SetPoint("TOPLEFT", 28, -225)
+    slider:SetMinMaxValues(5, 95)
+    slider:SetValueStep(5)
+
+    local sliderText = getglobal("MageCoreDefilersHealthSliderText")
+    local sliderLow = getglobal("MageCoreDefilersHealthSliderLow")
+    local sliderHigh = getglobal("MageCoreDefilersHealthSliderHigh")
+    if sliderLow then sliderLow:SetText("5%") end
+    if sliderHigh then sliderHigh:SetText("95%") end
+    local function UpdateSliderText(value)
+        if sliderText then
+            sliderText:SetText(
+                "Use after " .. value .. "% health lost")
+        end
+    end
+    slider:SetScript("OnValueChanged", function()
+        local value = math.floor(this:GetValue() + 0.5)
+        MageCore_Config.DefilersTalismanHealthLostPercent = value
+        UpdateSliderText(value)
+    end)
+    local savedPercent = tonumber(
+        MageCore_Config.DefilersTalismanHealthLostPercent) or 20
+    savedPercent = math.max(5, math.min(95, savedPercent))
+    MageCore_Config.DefilersTalismanHealthLostPercent = savedPercent
+    slider:SetValue(savedPercent)
+    UpdateSliderText(savedPercent)
+
+    local potionSlider = CreateFrame(
+        "Slider", "MageCoreHealingPotionSlider",
+        consumablePanel, "OptionsSliderTemplate")
+    potionSlider:SetWidth(250)
+    potionSlider:SetHeight(16)
+    potionSlider:SetPoint("TOPLEFT", 28, -305)
+    potionSlider:SetMinMaxValues(0, 60)
+    potionSlider:SetValueStep(5)
+
+    local potionText = getglobal("MageCoreHealingPotionSliderText")
+    local potionLow = getglobal("MageCoreHealingPotionSliderLow")
+    local potionHigh = getglobal("MageCoreHealingPotionSliderHigh")
+    if potionLow then potionLow:SetText("Off") end
+    if potionHigh then potionHigh:SetText("60%") end
+    local function UpdatePotionText(value)
+        if not potionText then return end
+        if value <= 0 then
+            potionText:SetText("Healing potion/draught: OFF")
+        else
+            potionText:SetText(
+                "Use at " .. value .. "% health")
+        end
+    end
+    potionSlider:SetScript("OnValueChanged", function()
+        local value = math.floor(this:GetValue() + 0.5)
+        MageCore_Config.HealingPotionHealthLostPercent = value
+        UpdatePotionText(value)
+    end)
+    potionSlider:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Healing Potion / Draught")
+        GameTooltip:AddLine(
+            "Rotation uses the strongest ready Healing Potion or Healing Draught in your bags at or below the selected health percentage.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:AddLine(
+            "Battleground-only draughts are used only inside an active battleground.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:AddLine(
+            "Set the slider to Off to disable automatic potion use.",
+            0.8, 0.8, 0.8, 1, true)
+        GameTooltip:Show()
+    end)
+    potionSlider:SetScript(
+        "OnLeave", function() GameTooltip:Hide() end)
+    local savedPotionPercent = tonumber(
+        MageCore_Config.HealingPotionHealthLostPercent) or 0
+    savedPotionPercent =
+        math.max(0, math.min(60, savedPotionPercent))
+    MageCore_Config.HealingPotionHealthLostPercent = savedPotionPercent
+    potionSlider:SetValue(savedPotionPercent)
+    UpdatePotionText(savedPotionPercent)
+end
+
+-- Kept outside MageCore_CreateMenu because Vanilla Lua limits each function
+-- to 32 captured outer locals.
+function MageCore_CreateSpellDrop(parent, label, key, x, y, listKind)
+    local labelText = parent:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    labelText:SetPoint("TOPLEFT", x + 15, y)
+    labelText:SetText(ACCENT .. label .. "|r")
+
+    local dropdown = CreateFrame(
+        "Frame", "MC_Drop_" .. key, parent, "UIDropDownMenuTemplate")
+    dropdown:SetPoint("TOPLEFT", x, y - 15)
+    UIDropDownMenu_SetWidth(145, dropdown)
+    UIDropDownMenu_Initialize(dropdown, function()
+        local list = spellBookSpells
+        if listKind == "armor" then
+            list = armorSpellBookSpells
+        elseif listKind == "buff" then
+            list = regularBuffSpellBookSpells
+        end
+        local _, value
+        for _, value in ipairs(list) do
+            local selected = value
+            local info = {}
+            info.text = value
+            info.value = value
+            info.func = function()
+                MageCore_Config[key] = selected
+                UIDropDownMenu_SetSelectedValue(dropdown, selected)
+                UIDropDownMenu_SetText(selected, dropdown)
+            end
+            UIDropDownMenu_AddButton(info)
+        end
+    end)
+
+    local current = MageCore_Config[key] or "None"
+    UIDropDownMenu_SetSelectedValue(dropdown, current)
+    UIDropDownMenu_SetText(current, dropdown)
 end
 
 local function FormatRotationBoxCooldown(seconds)
@@ -2588,9 +3111,10 @@ local function GetRotationBoxSpellState(spellName, isNext)
     elseif duration and duration > 1.5 and remaining > 0 then
         state, red, green, blue =
             "CD " .. FormatRotationBoxCooldown(remaining), 1, 0.55, 0.1
-    elseif manaCost and mana < manaCost then
+    elseif SpellIsManaBlocked(spellName) then
         state, red, green, blue =
-            "MANA " .. mana .. "/" .. manaCost, 0.35, 0.55, 1
+            (manaCost and ("MANA " .. mana .. "/" .. manaCost) or "MANA"),
+            0.35, 0.55, 1
     elseif IsRangeBlocked(spellName)
         or (spellName == "Cone of Cold"
             and HasLivingEnemyTarget()
@@ -3055,7 +3579,7 @@ function MageCore_CreateMenu()
 
     local buffHelp = buffPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     buffHelp:SetPoint("TOPLEFT", 10, 0); buffHelp:SetWidth(375); buffHelp:SetJustifyH("LEFT")
-    buffHelp:SetText("Choose learned mage buffs. Group Intellect cycles through the roster. Main Rotation always maintains Amplify Magic on the preference below.")
+    buffHelp:SetText("Choose one learned armor and up to five other mage buffs. Group Intellect cycles through the roster. Main Rotation maintains Amplify Magic below.")
 
     local foodTitle = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     foodTitle:SetPoint("TOPLEFT", 18, -8)
@@ -3193,7 +3717,7 @@ function MageCore_CreateMenu()
     consumableHelp:SetPoint("TOPLEFT", 18, -48)
     consumableHelp:SetWidth(350)
     consumableHelp:SetJustifyH("LEFT")
-    consumableHelp:SetText("Out of combat, Rotation can maintain one Mana Agate in your bags. It never consumes the gem.")
+    consumableHelp:SetText("Rotation maintains one Mana Agate out of combat and uses it at 200 mana or below.")
 
     local manaAgateButton = CreateFrame("Button", nil, consumablePanel)
     manaAgateButton:SetWidth(190); manaAgateButton:SetHeight(32)
@@ -3214,40 +3738,17 @@ function MageCore_CreateMenu()
     manaAgateButton:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Mana Agate")
-        GameTooltip:AddLine("Conjures one when none is in your bags.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Only runs out of combat through Rotation.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("The created Mana Agate is never consumed automatically.", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Conjures one when missing and uses it at 200 mana or below.", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Conjuring runs out of combat through Rotation.", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Both combat buttons can use a ready gem.", 0.8, 0.8, 0.8)
         GameTooltip:Show()
     end)
     manaAgateButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    local function MakeDrop(parent, label, key, x, y, helpfulOnly)
-        local labelText = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        labelText:SetPoint("TOPLEFT", x + 15, y); labelText:SetText(ACCENT .. label .. "|r")
-        local dropdown = CreateFrame("Frame", "MC_Drop_" .. key, parent, "UIDropDownMenuTemplate")
-        dropdown:SetPoint("TOPLEFT", x, y - 15)
-        UIDropDownMenu_SetWidth(145, dropdown)
-        UIDropDownMenu_Initialize(dropdown, function()
-            local list = helpfulOnly and helpfulSpellBookSpells or spellBookSpells
-            local _, value
-            for _, value in ipairs(list) do
-                local selected = value
-                local info = {}
-                info.text = value; info.value = value
-                info.func = function()
-                    MageCore_Config[key] = selected
-                    UIDropDownMenu_SetSelectedValue(dropdown, selected)
-                    UIDropDownMenu_SetText(selected, dropdown)
-                end
-                UIDropDownMenu_AddButton(info)
-            end
-        end)
-        local current = MageCore_Config[key] or "None"
-        UIDropDownMenu_SetSelectedValue(dropdown, current)
-        UIDropDownMenu_SetText(current, dropdown)
-    end
+    MageCore_CreateDefilersTalismanButton(consumablePanel)
 
-    MakeDrop(rotationPanel, "Opener:", "Opener", 100, -45)
+    MageCore_CreateSpellDrop(
+        rotationPanel, "Opener:", "Opener", 100, -45)
 
     local rotationPositions = {
         { 0, -102 }, { 200, -102 }, { 0, -158 },
@@ -3259,30 +3760,38 @@ function MageCore_CreateMenu()
     }
     local i
     for i = 1, 6 do
-        MakeDrop(rotationPanel, "Rotation Slot " .. i .. ":", "Rotation" .. i,
+        MageCore_CreateSpellDrop(
+            rotationPanel, "Rotation Slot " .. i .. ":", "Rotation" .. i,
             rotationPositions[i][1], rotationPositions[i][2])
-        MakeDrop(buffPanel, "Buff Slot " .. i .. ":", "Buff" .. i,
-            buffPositions[i][1], buffPositions[i][2], true)
+        local buffLabel = i == 1
+            and "Armor:" or "Buff Slot " .. (i - 1) .. ":"
+        MageCore_CreateSpellDrop(buffPanel, buffLabel, "Buff" .. i,
+            buffPositions[i][1], buffPositions[i][2],
+            i == 1 and "armor" or "buff")
 
-        local groupCheck = CreateFrame(
-            "CheckButton", "MageCoreBuff" .. i .. "GroupCheck",
-            buffPanel, "UICheckButtonTemplate")
-        groupCheck:SetWidth(20)
-        groupCheck:SetHeight(20)
-        groupCheck:SetPoint(
-            "TOPLEFT", buffPositions[i][1] + 15, buffPositions[i][2] - 47)
-        groupCheck:SetChecked(MageCore_Config["Buff" .. i .. "Group"] and 1 or nil)
-        local slot = i
-        groupCheck:SetScript("OnClick", function()
-            MageCore_Config["Buff" .. slot .. "Group"] =
-                this:GetChecked() and true or false
-            groupBlockedUnits = {}
-        end)
+        if i > 1 then
+            local groupCheck = CreateFrame(
+                "CheckButton", "MageCoreBuff" .. i .. "GroupCheck",
+                buffPanel, "UICheckButtonTemplate")
+            groupCheck:SetWidth(20)
+            groupCheck:SetHeight(20)
+            groupCheck:SetPoint(
+                "TOPLEFT", buffPositions[i][1] + 15,
+                buffPositions[i][2] - 47)
+            groupCheck:SetChecked(
+                MageCore_Config["Buff" .. i .. "Group"] and 1 or nil)
+            local slot = i
+            groupCheck:SetScript("OnClick", function()
+                MageCore_Config["Buff" .. slot .. "Group"] =
+                    this:GetChecked() and true or false
+                groupBlockedUnits = {}
+            end)
 
-        local groupCheckLabel = buffPanel:CreateFontString(
-            nil, "OVERLAY", "GameFontNormalSmall")
-        groupCheckLabel:SetPoint("LEFT", groupCheck, "RIGHT", 2, 0)
-        groupCheckLabel:SetText("Cast in group")
+            local groupCheckLabel = buffPanel:CreateFontString(
+                nil, "OVERLAY", "GameFontNormalSmall")
+            groupCheckLabel:SetPoint("LEFT", groupCheck, "RIGHT", 2, 0)
+            groupCheckLabel:SetText("Cast in group")
+        end
     end
 
     local targetedMagicLabel = buffPanel:CreateFontString(
@@ -3389,8 +3898,10 @@ function MageCore_CreateMenu()
     end)
     dragRotation:SetScript("OnLeave", function() GameTooltip:Hide() end)
     local rotationLabel = rotationPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    rotationLabel:SetPoint("LEFT", dragRotation, "RIGHT", 10, 0)
-    rotationLabel:SetText("Drag Rotation to your action bar")
+    rotationLabel:SetPoint("BOTTOM", dragRotation, "TOP", 0, 2)
+    rotationLabel:SetText("Rotation")
+
+    MageCore_CreateArcaneExplosionDragButton(rotationPanel)
 
     local dragIceBlock = CreateFrame("Button", nil, rotationPanel)
     dragIceBlock:SetWidth(48)
@@ -3927,6 +4438,16 @@ eventFrame:SetScript("OnEvent", function()
         channelSpellName = nil
     elseif event == "UI_ERROR_MESSAGE" then
         local message = string.lower(arg1 or "")
+        local notEnoughMana =
+            (SPELL_FAILED_NO_POWER and arg1 == SPELL_FAILED_NO_POWER)
+            or string.find(message, "not enough mana", 1, true)
+        if notEnoughMana and lastCombatSpellAttempt
+            and GetTime() - lastCombatSpellAttempt.time < 1.5 then
+            -- Some Vanilla clients fail to expose mana costs or the
+            -- IsUsableSpell power flag for particular Turtle spells. Force
+            -- the next Rotation press through the wand fallback.
+            lowManaWandFallbackUntil = GetTime() + 3
+        end
         local outOfRange = (SPELL_FAILED_OUT_OF_RANGE and arg1 == SPELL_FAILED_OUT_OF_RANGE)
             or string.find(message, "out of range", 1, true)
             or string.find(message, "too far away", 1, true)
@@ -4029,6 +4550,8 @@ eventFrame:SetScript("OnUpdate", function()
         UpdateRotationCooldown(nextAction)
         UpdateRotationManaState(nextAction)
     end
+
+    MageCore_UpdateArcaneExplosionButton()
 
     local nextBuff = GetBuffDisplaySpell()
     local buffTexture = GetSpellTextureByName(nextBuff) or ICON_PATH .. "Spell_Holy_MagicalSentry"
