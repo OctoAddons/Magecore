@@ -6,7 +6,7 @@ if playerClass ~= "MAGE" then return end
 
 -- Kept in the code as well as in MageCore.toc: the client reads the .toc
 -- only when the game starts, so a /reload would show an old version.
-local VERSION = "1.12.0"
+local VERSION = "1.13.0"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
@@ -2030,11 +2030,6 @@ local function LoadDefaults()
     if MageCore_Config.XPBarX == nil then MageCore_Config.XPBarX = 0 end
     if MageCore_Config.XPBarY == nil then MageCore_Config.XPBarY = -200 end
     if MageCore_Config.XPBarScale == nil then MageCore_Config.XPBarScale = 100 end
-    if MageCore_Config.CastBarShown == nil then MageCore_Config.CastBarShown = false end
-    if MageCore_Config.CastBarLocked == nil then MageCore_Config.CastBarLocked = false end
-    if MageCore_Config.CastBarX == nil then MageCore_Config.CastBarX = 0 end
-    if MageCore_Config.CastBarY == nil then MageCore_Config.CastBarY = -150 end
-    if MageCore_Config.CastBarScale == nil then MageCore_Config.CastBarScale = 100 end
     if MageCore_Config.TargetCastBarShown == nil then
         MageCore_Config.TargetCastBarShown = true
     end
@@ -2055,6 +2050,7 @@ local function LoadDefaults()
     if MageCore_Config.HUDAlpha == nil then MageCore_Config.HUDAlpha = 80 end
     if MageCore_Config.HUDAlwaysShow == nil then MageCore_Config.HUDAlwaysShow = false end
     if MageCore_Config.HUDNumbers == nil then MageCore_Config.HUDNumbers = true end
+    if MageCore_Config.HUDCastBar == nil then MageCore_Config.HUDCastBar = true end
     if MageCore_Config.EnemyCooldowns == nil then
         MageCore_Config.EnemyCooldowns = true
     end
@@ -3884,9 +3880,8 @@ function BARS.MakeMovable(frame, prefix, lockKey)
 end
 
 -- ---------------------------------------------------------------------------
--- Player cast bar. Gold while casting, green while channeling, a short
--- flash on success and red on interrupt. While unlocked it stays visible as
--- a preview so it can be dragged into place.
+-- Player cast events, shared by the HUD cast bar and the switch that turns
+-- the default cast bar off while the HUD cast bar is on.
 -- ---------------------------------------------------------------------------
 local CB = {}
 local CAST_BAR_EVENTS = {
@@ -3914,228 +3909,6 @@ function CB.SetBlizzardBarEnabled(enabled)
         CastingBarFrame:Hide()
         S.blizzardCastBarDisabled = true
     end
-end
-
-function CB.ShowState()
-    local frame = S.castBarFrame
-    local cast = S.castState
-    if cast then
-        frame:SetAlpha(1)
-        frame:Show()
-        return
-    end
-    if not MageCore_Config.CastBarLocked then
-        -- Unlocked preview for positioning.
-        frame.bar:SetMinMaxValues(0, 1)
-        frame.bar:SetValue(0.6)
-        frame.bar:SetStatusBarColor(1, 0.7, 0)
-        frame.icon:SetTexture(ICON_PATH .. DEFAULT_ICON)
-        frame.name:SetText("MageCore cast bar - drag to move")
-        frame.time:SetText("")
-        frame.spark:Hide()
-        frame:SetAlpha(1)
-        frame:Show()
-    else
-        frame:Hide()
-    end
-end
-
-function CB.Start(spellName, seconds, channel)
-    local frame = S.castBarFrame
-    if not frame or not MageCore_Config.CastBarShown then return end
-    local now = GetTime()
-    S.castState = {
-        name = spellName or "",
-        startTime = now,
-        endTime = now + math.max(0.1, seconds or 0),
-        channel = channel
-    }
-    frame.bar:SetMinMaxValues(0, math.max(0.1, seconds or 0))
-    frame.bar:SetStatusBarColor(channel and 0.2 or 1, channel and 0.9 or 0.7,
-        channel and 0.3 or 0)
-    frame.icon:SetTexture(GetSpellTextureByName(spellName)
-        or ICON_PATH .. "INV_Misc_QuestionMark")
-    frame.name:SetText(spellName or "")
-    frame.spark:Show()
-    CB.ShowState()
-end
-
-function CB.Finish(success, label)
-    local frame = S.castBarFrame
-    local cast = S.castState
-    if not frame or not cast or cast.fading then return end
-    cast.fading = GetTime()
-    frame.spark:Hide()
-    if success then
-        local _, maximum = frame.bar:GetMinMaxValues()
-        frame.bar:SetValue(cast.channel and 0 or maximum)
-        if not cast.channel then frame.bar:SetStatusBarColor(0.2, 1, 0.2) end
-        frame.time:SetText("")
-    else
-        frame.bar:SetStatusBarColor(1, 0.15, 0.15)
-        frame.name:SetText(label or "Interrupted")
-        frame.time:SetText("")
-    end
-end
-
-function CB.OnUpdate()
-    local frame = S.castBarFrame
-    local cast = S.castState
-    if not cast then return end
-    local now = GetTime()
-    if cast.fading then
-        local alpha = 1 - (now - cast.fading) / 0.5
-        if alpha <= 0 then
-            S.castState = nil
-            CB.ShowState()
-        else
-            frame:SetAlpha(alpha)
-        end
-        return
-    end
-    local duration = cast.endTime - cast.startTime
-    local value
-    if cast.channel then
-        value = math.max(0, cast.endTime - now)
-    else
-        value = math.min(duration, now - cast.startTime)
-    end
-    frame.bar:SetValue(value)
-    frame.time:SetText(string.format("%.1f", math.max(0, cast.endTime - now)))
-    local width = frame.bar:GetWidth() or 0
-    if duration > 0 then
-        frame.spark:SetPoint("CENTER", frame.bar, "LEFT",
-            width * value / duration, 0)
-    end
-    -- Safety net in case a stop event is missed.
-    if now > cast.endTime + 0.5 then CB.Finish(true) end
-end
-
-function CB.OnEvent()
-    if not MageCore_Config or not MageCore_Config.CastBarShown then return end
-    local cast = S.castState
-    if event == "SPELLCAST_START" then
-        CB.Start(arg1, (tonumber(arg2) or 0) / 1000, false)
-    elseif event == "SPELLCAST_CHANNEL_START" then
-        CB.Start(arg2 or (cast and cast.name), (tonumber(arg1) or 0) / 1000, true)
-    elseif event == "SPELLCAST_DELAYED" then
-        if cast and not cast.channel and not cast.fading then
-            local delay = (tonumber(arg1) or 0) / 1000
-            cast.startTime = cast.startTime + delay
-            cast.endTime = cast.endTime + delay
-        end
-    elseif event == "SPELLCAST_CHANNEL_UPDATE" then
-        if cast and cast.channel and not cast.fading then
-            local remaining = (tonumber(arg1) or 0) / 1000
-            if remaining <= 0 then
-                CB.Finish(true)
-            else
-                cast.endTime = GetTime() + remaining
-            end
-        end
-    elseif event == "SPELLCAST_STOP" then
-        -- A stop during a channel belongs to the channel's own start.
-        if cast and not cast.channel then CB.Finish(true) end
-    elseif event == "SPELLCAST_CHANNEL_STOP" then
-        if cast and cast.channel then CB.Finish(true) end
-    elseif event == "SPELLCAST_INTERRUPTED" then
-        if cast then CB.Finish(false, "Interrupted") end
-    elseif event == "SPELLCAST_FAILED" then
-        if cast then CB.Finish(false, "Failed") end
-    end
-end
-
-function CB.Create()
-    if S.castBarFrame then return end
-    local frame = CreateFrame("Frame", "MageCoreCastBar", UIParent)
-    S.castBarFrame = frame
-    frame:SetWidth(240)
-    frame:SetHeight(20)
-    frame:SetFrameStrata("HIGH")
-    frame:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        tile = false, edgeSize = 1,
-        insets = { left = 0, right = 0, top = 0, bottom = 0 }
-    })
-    frame:SetBackdropColor(0, 0, 0, 0.6)
-    frame:SetBackdropBorderColor(0, 0, 0, 1)
-    BARS.MakeMovable(frame, "CastBar", "CastBarLocked")
-
-    frame.icon = frame:CreateTexture(nil, "ARTWORK")
-    frame.icon:SetWidth(20)
-    frame.icon:SetHeight(20)
-    frame.icon:SetPoint("RIGHT", frame, "LEFT", -2, 0)
-    frame.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-
-    frame.bar = CreateFrame("StatusBar", nil, frame)
-    frame.bar:SetPoint("TOPLEFT", 1, -1)
-    frame.bar:SetPoint("BOTTOMRIGHT", -1, 1)
-    frame.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
-
-    local overlay = CreateFrame("Frame", nil, frame)
-    overlay:SetAllPoints(frame)
-    overlay:SetFrameLevel(frame.bar:GetFrameLevel() + 1)
-    frame.spark = overlay:CreateTexture(nil, "OVERLAY")
-    frame.spark:SetTexture("Interface\\CastingBar\\UI-CastingBar-Spark")
-    frame.spark:SetBlendMode("ADD")
-    frame.spark:SetWidth(20)
-    frame.spark:SetHeight(36)
-    frame.name = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    frame.name:SetPoint("LEFT", 5, 0)
-    frame.time = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    frame.time:SetPoint("RIGHT", -5, 0)
-
-    local _, eventName
-    for _, eventName in ipairs(CAST_BAR_EVENTS) do
-        frame:RegisterEvent(eventName)
-    end
-    frame:SetScript("OnEvent", CB.OnEvent)
-    frame:SetScript("OnUpdate", CB.OnUpdate)
-    frame:Hide()
-end
-
-function CB.ApplyConfig()
-    if not MageCore_Config.CastBarShown then
-        S.castState = nil
-        if S.castBarFrame then S.castBarFrame:Hide() end
-        CB.SetBlizzardBarEnabled(true)
-        return
-    end
-    CB.Create()
-    CB.SetBlizzardBarEnabled(false)
-    BARS.Apply(S.castBarFrame, "CastBar", -150)
-    CB.ShowState()
-end
-
-function CB.Command(argument)
-    EnsureConfig()
-    local message
-    if argument == "" then
-        MageCore_Config.CastBarShown = not MageCore_Config.CastBarShown
-    elseif argument == "on" then
-        MageCore_Config.CastBarShown = true
-    elseif argument == "off" then
-        MageCore_Config.CastBarShown = false
-    elseif argument == "lock" then
-        MageCore_Config.CastBarLocked = true
-        message = "Cast bar locked."
-    elseif argument == "unlock" then
-        MageCore_Config.CastBarLocked = false
-        message = "Cast bar unlocked. Drag it to move it."
-    elseif argument == "reset" then
-        MageCore_Config.CastBarX = 0
-        MageCore_Config.CastBarY = -150
-        MageCore_Config.CastBarScale = 100
-        message = "Cast bar position and size reset."
-    else
-        message = "Use |cffffffff/mc cast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
-    end
-    CB.ApplyConfig()
-    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
-    message = message or ("Cast bar " .. (MageCore_Config.CastBarShown
-        and "|cff00ff00shown|r" or "|cffff4444hidden|r") .. ".")
-    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
 end
 
 -- ---------------------------------------------------------------------------
@@ -4766,9 +4539,134 @@ end
 -- ---------------------------------------------------------------------------
 local HUD = {
     TEXTURE = "Interface\\AddOns\\MageCore\\HUDArc",
-    ARC_WIDTH = 32, ARC_HEIGHT = 128, GAP = 150,
+    ARC_WIDTH = 32, ARC_HEIGHT = 128, GAP = 150, CAST_HEIGHT = 8,
     alpha = 0, health = 1, mana = 1
 }
+
+-- HUD cast bar: a thin straight yellow bar under the character, between
+-- the arcs. It follows the arc opacity; the spell name and time below it
+-- use the same outlined font as the numbers.
+function HUD.CreateCastBar(frame)
+    local bar = CreateFrame("StatusBar", nil, frame)
+    frame.cast = bar
+    bar:SetWidth(HUD.GAP - 10)
+    bar:SetHeight(HUD.CAST_HEIGHT)
+    bar:SetPoint("TOP", frame, "BOTTOM", 0, -6)
+    bar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+    bar.back = bar:CreateTexture(nil, "BACKGROUND")
+    bar.back:SetAllPoints(bar)
+    bar.back:SetTexture("Interface\\Buttons\\WHITE8X8")
+    bar.text = bar:CreateFontString(nil, "OVERLAY")
+    bar.text:SetFont("Fonts\\FRIZQT__.TTF", 12, "OUTLINE")
+    bar.text:SetTextColor(1, 1, 1, 1)
+    bar.text:SetPoint("TOP", bar, "BOTTOM", 0, -3)
+    bar:Hide()
+
+    local _, eventName
+    for _, eventName in ipairs(CAST_BAR_EVENTS) do
+        frame:RegisterEvent(eventName)
+    end
+    frame:SetScript("OnEvent", HUD.OnCastEvent)
+end
+
+function HUD.FinishCast(success, label)
+    local cast = HUD.cast
+    if not cast or cast.done then return end
+    cast.done = GetTime()
+    cast.success = success
+    cast.label = label
+end
+
+function HUD.OnCastEvent()
+    local cast = HUD.cast
+    local now = GetTime()
+    if event == "SPELLCAST_START" then
+        HUD.cast = { name = arg1 or "", startTime = now,
+            endTime = now + math.max(0.1, (tonumber(arg2) or 0) / 1000) }
+    elseif event == "SPELLCAST_CHANNEL_START" then
+        HUD.cast = { name = arg2 or (cast and cast.name) or "",
+            startTime = now, channel = true,
+            endTime = now + math.max(0.1, (tonumber(arg1) or 0) / 1000) }
+    elseif event == "SPELLCAST_DELAYED" then
+        if cast and not cast.channel and not cast.done then
+            local delay = (tonumber(arg1) or 0) / 1000
+            cast.startTime = cast.startTime + delay
+            cast.endTime = cast.endTime + delay
+        end
+    elseif event == "SPELLCAST_CHANNEL_UPDATE" then
+        if cast and cast.channel and not cast.done then
+            local remaining = (tonumber(arg1) or 0) / 1000
+            if remaining <= 0 then
+                HUD.FinishCast(true)
+            else
+                cast.endTime = now + remaining
+            end
+        end
+    elseif event == "SPELLCAST_STOP" then
+        -- A stop during a channel belongs to the channel's own start.
+        if cast and not cast.channel then HUD.FinishCast(true) end
+    elseif event == "SPELLCAST_CHANNEL_STOP" then
+        if cast and cast.channel then HUD.FinishCast(true) end
+    elseif event == "SPELLCAST_INTERRUPTED" then
+        HUD.FinishCast(false, "Interrupted")
+    elseif event == "SPELLCAST_FAILED" then
+        HUD.FinishCast(false, "Failed")
+    end
+end
+
+function HUD.UpdateCastBar(opacity)
+    local bar = S.hudFrame.cast
+    if not MageCore_Config.HUDCastBar then
+        bar:Hide()
+        return
+    end
+    local cast = HUD.cast
+    local now = GetTime()
+    local red, green, blue, alpha = 1, 0.82, 0, 1
+    if not cast then
+        if MageCore_Config.HUDLocked then
+            bar:Hide()
+            return
+        end
+        -- Preview while the HUD is unlocked for moving.
+        bar:SetMinMaxValues(0, 1)
+        bar:SetValue(0.6)
+        bar.text:SetText("Preview - /mc hud move to lock")
+    else
+        local duration = math.max(0.1, cast.endTime - cast.startTime)
+        bar:SetMinMaxValues(0, duration)
+        if cast.done then
+            alpha = 1 - (now - cast.done) / 0.5
+            if alpha <= 0 then
+                HUD.cast = nil
+                bar:Hide()
+                return
+            end
+            if cast.success then
+                red, green, blue = 0.2, 1, 0.2
+                bar:SetValue(cast.channel and 0 or duration)
+                bar.text:SetText(cast.name)
+            else
+                red, green, blue = 1, 0.15, 0.15
+                bar.text:SetText(cast.label or "Interrupted")
+            end
+        else
+            if cast.channel then
+                bar:SetValue(math.max(0, cast.endTime - now))
+            else
+                bar:SetValue(math.min(duration, now - cast.startTime))
+            end
+            bar.text:SetText(cast.name .. "  "
+                .. string.format("%.1f", math.max(0, cast.endTime - now)))
+            -- Safety net in case a stop event is missed.
+            if now > cast.endTime + 0.5 then HUD.FinishCast(true) end
+        end
+    end
+    bar:SetStatusBarColor(red, green, blue, opacity)
+    bar.back:SetVertexColor(0, 0, 0, 0.5 * opacity)
+    bar:SetAlpha(alpha)
+    bar:Show()
+end
 
 function HUD.MakeArc(frame, point, mirrored)
     local arc = {}
@@ -4819,6 +4717,7 @@ function HUD.IsWanted()
     if UnitAffectingCombat("player") or HasLivingEnemyTarget() then
         return true
     end
+    if HUD.cast and MageCore_Config.HUDCastBar then return true end
     return UnitHealth("player") < UnitHealthMax("player")
         or UnitMana("player") < UnitManaMax("player")
 end
@@ -4849,6 +4748,7 @@ function HUD.OnUpdate()
     frame.mana.fill:SetVertexColor(0.25, 0.55, 1, opacity)
     frame.health.back:SetVertexColor(0, 0, 0, 0.5 * opacity)
     frame.mana.back:SetVertexColor(0, 0, 0, 0.5 * opacity)
+    HUD.UpdateCastBar(opacity)
 
     if MageCore_Config.HUDNumbers then
         frame.health.text:SetText(math.floor(health * 100 + 0.5) .. "%")
@@ -4877,6 +4777,7 @@ function HUD.Create()
     BARS.MakeMovable(frame, "HUD", "HUDLocked")
     frame.health = HUD.MakeArc(frame, "BOTTOMLEFT", false)
     frame.mana = HUD.MakeArc(frame, "BOTTOMRIGHT", true)
+    HUD.CreateCastBar(frame)
     -- SetTexture returns nil for a file the client has not indexed yet,
     -- which happens until WoW is restarted after installing a new image.
     if not frame.health.back:SetTexture(HUD.TEXTURE) then
@@ -4891,6 +4792,9 @@ end
 
 function HUD.ApplyConfig()
     EnsureConfig()
+    -- The default cast bar stays off while the HUD cast bar is on.
+    CB.SetBlizzardBarEnabled(not (MageCore_Config.HUDShown
+        and MageCore_Config.HUDCastBar))
     if not MageCore_Config.HUDShown then
         if S.hudFrame then S.hudFrame:Hide() end
         return
@@ -5750,7 +5654,6 @@ local function AfterSettingsChanged()
     UI.RefreshMenuControls()
     NP.ApplyNameplateVisibility()
     XP.ApplyConfig()
-    CB.ApplyConfig()
     TGT.ApplyConfig()
     HUD.ApplyConfig()
 end
@@ -5820,7 +5723,6 @@ local function PrintHelp()
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc box on/off|r  rotation monitor")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc profile save/load/delete <name>|r, |cffffffff/mc profile list|r")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc xp on/off/lock/unlock/reset|r  movable XP bar")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc cast on/off/lock/unlock/reset|r  movable cast bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast on/off/lock/unlock/reset|r  target cast bar and no-slow alert")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast test|r  show a fake fight on the target cast bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast move|r  unlock the target cast bar to drag it, again to lock")
@@ -5842,8 +5744,6 @@ local function SlashCommand(message)
         Chat("Type |cffffffff/mc reset confirm|r to restore default settings. Saved profiles are kept.")
     elseif command == "reset confirm" then
         ResetSettings()
-    elseif command == "cast" or string.find(command, "^cast%s") then
-        CB.Command((string.gsub(command, "^cast%s*", "")))
     elseif command == "tcast" or string.find(command, "^tcast%s") then
         TGT.Command((string.gsub(command, "^tcast%s*", "")))
     elseif command == "xp" or string.find(command, "^xp%s") then
@@ -6384,36 +6284,16 @@ function UI.BuildBarsPanel(panel)
             return "XP bar size: " .. value .. "%"
         end)
 
-    UI.MakeToggleButton(panel, 150, 18, -180, "Cast Bar", "CastBarShown",
-        "Cast Bar",
-        "Shows a movable cast bar with spell icon, name and remaining time. The default cast bar is hidden while this one is on.",
-        CB.ApplyConfig)
-    UI.MakeCheckBox(panel, "MageCoreCastBarLockCheck", 185, -184,
-        "Lock cast bar", "CastBarLocked",
-        function()
-            if S.castBarFrame and MageCore_Config.CastBarShown then
-                CB.ShowState()
-            end
-        end,
-        "Lock cast bar",
-        "While unlocked, the cast bar stays visible as a preview so you can drag it into place.")
-    UI.MakeSlider(panel, "MageCoreCastBarScaleSlider", 28, -235, 50, 200, 5,
-        "CastBarScale", 100, "50%", "200%",
-        function(value)
-            if S.castBarFrame then BARS.Apply(S.castBarFrame, "CastBar", -150) end
-            return "Cast bar size: " .. value .. "%"
-        end)
-
-    UI.MakeToggleButton(panel, 150, 18, -280, "Target Cast", "TargetCastBarShown",
+    UI.MakeToggleButton(panel, 150, 18, -180, "Target Cast", "TargetCastBarShown",
         "Target Cast Bar",
         "Shows a large movable bar with what your current target is casting: spell icon, name and remaining time. Gold while casting, green while channeling, red when interrupted. The PvP tab's No-slow alert sits just above it and moves with it.",
         TGT.ApplyConfig)
-    UI.MakeCheckBox(panel, "MageCoreTargetCastBarLockCheck", 185, -284,
+    UI.MakeCheckBox(panel, "MageCoreTargetCastBarLockCheck", 185, -184,
         "Lock target cast bar", "TargetCastBarLocked",
         TGT.ApplyConfig,
         "Lock target cast bar",
         "While unlocked, the target cast bar and the no-slow alert show a preview so you can drag them into place.")
-    UI.MakeSlider(panel, "MageCoreTargetCastBarScaleSlider", 28, -335, 50, 200, 5,
+    UI.MakeSlider(panel, "MageCoreTargetCastBarScaleSlider", 28, -235, 50, 200, 5,
         "TargetCastBarScale", 100, "50%", "200%",
         function(value)
             if S.targetBarFrame then
@@ -6425,7 +6305,7 @@ function UI.BuildBarsPanel(panel)
     local moveButton = CreateFrame("Button", nil, panel)
     moveButton:SetWidth(90)
     moveButton:SetHeight(26)
-    moveButton:SetPoint("TOPLEFT", 295, -327)
+    moveButton:SetPoint("TOPLEFT", 295, -227)
     StyleButton(moveButton)
     local moveText = moveButton:CreateFontString(
         nil, "OVERLAY", "GameFontNormalSmall")
@@ -6439,8 +6319,8 @@ function UI.BuildBarsPanel(panel)
     UI.AddSimpleTooltip(moveButton, "Move target cast bar",
         "Closes this window and unlocks the target cast bar, the no-slow alert and the cooldown icons so you can drag them. Type |cffffffff/mc tcast move|r or press Lock here to lock them again.")
 
-    UI.AddHelpText(panel, 18, -372,
-        "|cffffffff/mc xp|r, |cffffffff/mc cast|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset")
+    UI.AddHelpText(panel, 18, -280,
+        "|cffffffff/mc xp|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset\nYour own cast bar is part of the HUD (HUD tab).")
 end
 
 function UI.BuildHUDPanel(panel)
@@ -6475,18 +6355,22 @@ function UI.BuildHUDPanel(panel)
         "Keeps the HUD visible all the time. When off, it shows in combat, with an enemy targeted, or while your health or mana is not full.")
     UI.MakeToggleButton(panel, 180, 210, -120, "Numbers", "HUDNumbers",
         "Numbers", "Shows health and mana percentages under the arcs.")
+    UI.MakeToggleButton(panel, 180, 18, -165, "Cast bar", "HUDCastBar",
+        "HUD cast bar",
+        "Shows a thin yellow bar under your character with the spell you are casting and the time left, in the same see-through style as the arcs. It flashes green when the cast finishes and red when it is interrupted. The default cast bar is hidden while it is on.",
+        HUD.ApplyConfig)
 
-    UI.MakeSlider(panel, "MageCoreHUDScaleSlider", 28, -180, 50, 200, 5,
+    UI.MakeSlider(panel, "MageCoreHUDScaleSlider", 28, -225, 50, 200, 5,
         "HUDScale", 100, "50%", "200%",
         function(value)
             if S.hudFrame then BARS.Apply(S.hudFrame, "HUD", -20) end
             return "HUD size: " .. value .. "%"
         end)
-    UI.MakeSlider(panel, "MageCoreHUDAlphaSlider", 28, -230, 5, 100, 5,
+    UI.MakeSlider(panel, "MageCoreHUDAlphaSlider", 28, -275, 5, 100, 5,
         "HUDAlpha", 80, "5%", "100%",
         function(value) return "Arc opacity: " .. value .. "%" end)
 
-    UI.AddHelpText(panel, 18, -275,
+    UI.AddHelpText(panel, 18, -320,
         "|cffffffff/mc hud on/off|r  show or hide the HUD\n"
         .. "|cffffffff/mc hud move|r  unlock to drag, again to lock\n"
         .. "|cffffffff/mc hud reset|r  back to the middle at 100% size")
@@ -6722,7 +6606,6 @@ eventFrame:SetScript("OnEvent", function()
     elseif event == "PLAYER_LOGIN" then
         LoadDefaults(); RefreshSpellBook(); CreateMinimapButton(); SetupRotationButtonTooltips()
         XP.ApplyConfig()
-        CB.ApplyConfig()
         TGT.ApplyConfig()
         if MageCore_Config.RotationBoxShown then
             CreateRotationBox()

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.0
+- New **HUD cast bar** (HUD tab, on by default): a thin straight yellow bar under your character, between the health and mana arcs, with the spell you are casting and the time left. It follows pushback and channels, flashes green when a cast finishes and red when it is interrupted or fails, and uses the same arc opacity and outlined font as the rest of the HUD. The default cast bar is hidden while it is on. Switch it off with the **Cast bar** toggle.
+- Removed the separate movable player cast bar from the Bars tab and the `/mc cast` command; the HUD cast bar replaces it. The target cast bar is unchanged.
+
 ## 1.12.0
 - New **HUD** tab with a health arc on the left and a mana arc on the right of your character. Health turns from green to yellow to red as it drops, mana is blue, and both slide smoothly to their new value. It shows in combat, with an enemy targeted or while health or mana is not full, and fades out while idle. On by default; switch it off with the **HUD** toggle or `/mc hud off`.
 - HUD options: **Always show**, **Numbers** (percentages under the arcs), size (50–200%) and **Arc opacity** (5–100%) sliders, where opacity makes only the arcs see-through and the numbers stay readable (larger, with a black outline), and a **Move HUD** button. The HUD never catches mouse clicks unless it is unlocked.
