@@ -2,7 +2,7 @@
 ## Title: MageCore
 ## Notes: Mage rotation and buff helper for Turtle WoW
 ## Author: Michael
-## Version: 1.14.0
+## Version: 1.15.0
 ## SavedVariables: MageCore_Config
 
 MageCore.lua

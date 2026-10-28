@@ -6,7 +6,7 @@ if playerClass ~= "MAGE" then return end
 
 -- Kept in the code as well as in MageCore.toc: the client reads the .toc
 -- only when the game starts, so a /reload would show an old version.
-local VERSION = "1.14.0"
+local VERSION = "1.15.0"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
@@ -2042,6 +2042,7 @@ local function LoadDefaults()
         MageCore_Config.TargetCastBarScale = 100
     end
     if MageCore_Config.NoSlowAlert == nil then MageCore_Config.NoSlowAlert = true end
+    if MageCore_Config.FreedomCoach == nil then MageCore_Config.FreedomCoach = true end
     if MageCore_Config.HUDShown == nil then MageCore_Config.HUDShown = true end
     if MageCore_Config.HUDLocked == nil then MageCore_Config.HUDLocked = true end
     if MageCore_Config.HUDX == nil then MageCore_Config.HUDX = 0 end
@@ -4080,9 +4081,19 @@ function TGT.OnCastEvent()
         local ok, spellName, _, spellTexture = pcall(SpellInfo, arg4)
         if ok then name, texture = spellName, spellTexture end
     end
-    -- For /mc tcast debug.
+    -- For /mc tcast debug: the last few spells each caster was seen using.
     TGT.eventCount = (TGT.eventCount or 0) + 1
     TGT.lastEvent = tostring(kind) .. " " .. tostring(name) .. " from " .. tostring(guid)
+    -- Only the current target is kept, so the list never grows.
+    if guid == GetUnitGUID("target") then
+        if not TGT.recent or TGT.recent.guid ~= guid then
+            TGT.recent = { guid = guid, spells = {} }
+        end
+        table.insert(TGT.recent.spells, 1, tostring(kind) .. " " .. tostring(name))
+        if table.getn(TGT.recent.spells) > 6 then
+            table.remove(TGT.recent.spells)
+        end
+    end
     if (kind == "CAST" or kind == "CHANNEL") and name
         and TGT.COOLDOWNS[name] then
         TGT.cooldowns[guid] = TGT.cooldowns[guid] or {}
@@ -4346,6 +4357,134 @@ function TGT.UpdateCooldowns(unlocked)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Freedom coach: while an enemy player target has Blessing of Freedom (or a
+-- Free Action potion), a large pulsing warning above the character says
+-- what to do right now, and a warning sound plays whenever the advice
+-- changes. When Freedom ends, it says so, because Frost Nova works again.
+-- ---------------------------------------------------------------------------
+TGT.COACH_GONE_SECONDS = 2.5
+
+function TGT.IsTargetWithin10Yards()
+    if UnitPosition then
+        local playerOK, playerX, playerY = pcall(UnitPosition, "player")
+        local unitOK, unitX, unitY = pcall(UnitPosition, "target")
+        if playerOK and unitOK and playerX and playerY and unitX and unitY then
+            local deltaX, deltaY = playerX - unitX, playerY - unitY
+            return deltaX * deltaX + deltaY * deltaY <= 100
+        end
+    end
+    local ok, inRange = pcall(CheckInteractDistance, "target", 3)
+    return ok and inRange
+end
+
+local function CoachSpellReady(spellName)
+    return GetSpellBookIndex(spellName) and IsSpellReady(spellName)
+        and HasEnoughManaForSpell(spellName)
+end
+
+-- Returns the warning, a hint line and the colour, or nil.
+function TGT.GetCoachAdvice()
+    -- /mc tcast test walks through the warnings without a real Paladin.
+    local elapsed = TGT.TestTime()
+    if elapsed then
+        if elapsed < 3 then
+            return "FREEDOM - BLINK AWAY!", "Then Polymorph him. Slows and Frost Nova do not work.", "orange"
+        elseif elapsed < 6 then
+            return "FREEDOM - SHEEP HIM NOW!", "Polymorph works through Freedom. Walk away while he is a sheep.", "red"
+        elseif elapsed < 8.5 then
+            return "FREEDOM GONE - NOVA HIM!", "Then Blink away and kite.", "green"
+        end
+        return nil
+    end
+    local guid = GetUnitGUID("target") or UnitName("target")
+    local _, _, kind = GetTargetSlowImmunity()
+    local hasFreedom = kind == "FREEDOM" and UnitIsPlayer("target")
+    if hasFreedom then
+        TGT.coachFreedomTarget = guid
+        TGT.coachGoneUntil = nil
+        local close = TGT.IsTargetWithin10Yards()
+        local health = UnitHealth("player") / math.max(1, UnitHealthMax("player"))
+        if close and CoachSpellReady("Blink") then
+            return "FREEDOM - BLINK AWAY!", "Then Polymorph him. Slows and Frost Nova do not work.", "orange"
+        elseif not close and CoachSpellReady("Polymorph") then
+            return "FREEDOM - SHEEP HIM NOW!", "Polymorph works through Freedom. Walk away while he is a sheep.", "red"
+        elseif close and health < 0.5 and CoachSpellReady("Ice Block") then
+            return "FREEDOM - ICE BLOCK!", "Wait out Freedom, then Frost Nova.", "red"
+        elseif close then
+            return "FREEDOM - SHIELD UP, FIRE BLAST!", "No Blink: shield yourself and keep hitting.", "orange"
+        end
+        return "FREEDOM - KEEP YOUR DISTANCE", "Do not waste Frost Nova or Cone of Cold yet.", "orange"
+    end
+
+    -- Freedom just ended on the same target: tell the player to slow now.
+    local now = GetTime()
+    if TGT.coachFreedomTarget and TGT.coachFreedomTarget == guid
+        and HasLivingEnemyTarget() then
+        TGT.coachFreedomTarget = nil
+        TGT.coachGoneUntil = now + TGT.COACH_GONE_SECONDS
+    elseif TGT.coachFreedomTarget ~= guid then
+        TGT.coachFreedomTarget = nil
+    end
+    if TGT.coachGoneUntil and now < TGT.coachGoneUntil then
+        if TGT.IsTargetWithin10Yards() and CoachSpellReady("Frost Nova") then
+            return "FREEDOM GONE - NOVA HIM!", "Then Blink away and kite.", "green"
+        end
+        return "FREEDOM GONE - SLOW HIM!", "Frostbolt or Cone of Cold works again.", "green"
+    end
+    TGT.coachGoneUntil = nil
+    return nil
+end
+
+TGT.COACH_COLORS = {
+    red = { 1, 0.2, 0.2 }, orange = { 1, 0.6, 0.1 }, green = { 0.3, 1, 0.3 }
+}
+
+function TGT.UpdateCoach()
+    local frame = S.coachFrame
+    if not frame then return end
+    local text, hint, color
+    if MageCore_Config.FreedomCoach or TGT.testStart then
+        text, hint, color = TGT.GetCoachAdvice()
+    end
+    if not text then
+        TGT.coachText = nil
+        frame:Hide()
+        return
+    end
+    if text ~= TGT.coachText then
+        TGT.coachText = text
+        pcall(PlaySound, "RaidWarning")
+    end
+    local rgb = TGT.COACH_COLORS[color] or TGT.COACH_COLORS.orange
+    frame.text:SetText(text)
+    frame.text:SetTextColor(rgb[1], rgb[2], rgb[3])
+    frame.hint:SetText(hint or "")
+    frame:Show()
+end
+
+function TGT.CreateCoach()
+    if S.coachFrame then return end
+    local frame = CreateFrame("Frame", "MageCoreFreedomCoach", UIParent)
+    S.coachFrame = frame
+    frame:SetWidth(500)
+    frame:SetHeight(60)
+    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 150)
+    frame:SetFrameStrata("HIGH")
+    frame.text = frame:CreateFontString(nil, "OVERLAY")
+    frame.text:SetFont("Fonts\\FRIZQT__.TTF", 26, "THICKOUTLINE")
+    frame.text:SetPoint("TOP", 0, 0)
+    frame.hint = frame:CreateFontString(nil, "OVERLAY")
+    frame.hint:SetFont("Fonts\\FRIZQT__.TTF", 14, "OUTLINE")
+    frame.hint:SetTextColor(1, 1, 1)
+    frame.hint:SetPoint("TOP", frame.text, "BOTTOM", 0, -4)
+    -- Pulse so the warning keeps catching the eye while it is up.
+    frame:SetScript("OnUpdate", function()
+        this.text:SetAlpha(0.55 + 0.45 * math.abs(math.sin(GetTime() * 5)))
+    end)
+    frame:Hide()
+end
+
 function TGT.OnUpdate()
     local unlocked = not MageCore_Config.TargetCastBarLocked
     TGT.UpdateCastBar(unlocked)
@@ -4355,6 +4494,7 @@ function TGT.OnUpdate()
         TGT.nextAlertCheck = now + 0.1
         TGT.UpdateAlert(unlocked)
         TGT.UpdateCooldowns(unlocked)
+        TGT.UpdateCoach()
     end
 end
 
@@ -4445,12 +4585,16 @@ end
 function TGT.ApplyConfig()
     local enabled = MageCore_Config.TargetCastBarShown
         or MageCore_Config.NoSlowAlert or MageCore_Config.EnemyCooldowns
-        or MageCore_Config.CounterspellLockout
+        or MageCore_Config.CounterspellLockout or MageCore_Config.FreedomCoach
+    if not MageCore_Config.FreedomCoach and S.coachFrame then
+        S.coachFrame:Hide()
+    end
     if not enabled then
         if S.targetBarFrame then S.targetBarFrame:Hide() end
         return
     end
     TGT.Create()
+    TGT.CreateCoach()
     BARS.Apply(S.targetBarFrame, "TargetCastBar", -100)
     -- The frame stays shown for its OnUpdate; it only catches the mouse
     -- while unlocked so a locked, empty bar never blocks clicks.
@@ -4471,6 +4615,7 @@ function TGT.Command(argument)
         return
     elseif argument == "test" then
         TGT.Create()
+        TGT.CreateCoach()
         BARS.Apply(S.targetBarFrame, "TargetCastBar", -100)
         TGT.testStart = GetTime()
         S.targetBarFrame:Show()
@@ -4494,6 +4639,22 @@ function TGT.Command(argument)
         DEFAULT_CHAT_FRAME:AddMessage("  target cast now: "
             .. (cast and (tostring(cast.name) .. " (" .. string.format("%.1f",
                 cast.endTime - GetTime()) .. "s)") or "none"))
+        local recent = guid and TGT.recent and TGT.recent.guid == guid
+            and TGT.recent.spells
+        DEFAULT_CHAT_FRAME:AddMessage("  target seen casting: "
+            .. (recent and table.concat(recent, ", ") or "nothing"))
+        local tracked, spellName, entry = {}
+        local spells = guid and TGT.cooldowns[guid]
+        if spells then
+            for spellName, entry in pairs(spells) do
+                table.insert(tracked, spellName .. " "
+                    .. math.ceil(entry.expires - GetTime()) .. "s")
+            end
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  target cooldowns: "
+            .. (table.getn(tracked) > 0 and table.concat(tracked, ", ") or "none")
+            .. " (Enemy cooldowns " .. (MageCore_Config.EnemyCooldowns
+                and "on" or "off") .. ")")
         return
     elseif argument == "" then
         MageCore_Config.TargetCastBarShown = not MageCore_Config.TargetCastBarShown
@@ -6182,7 +6343,11 @@ function UI.BuildPvPPanel(panel)
             "Rotation's PvP logic knows about it and will not repeat it right away.",
             "Drag onto an action bar."
         })
-    UI.AddHelpText(panel, 80, -350, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
+    UI.AddHelpText(panel, 80, -340, "Drag |cffffffffR1 Frostbolt|r to an\naction bar: always Rank 1 Frostbolt.")
+    UI.MakeToggleButton(panel, 180, 210, -345, "Freedom coach", "FreedomCoach",
+        "Freedom coach",
+        "While your enemy target has Blessing of Freedom or a Free Action potion, a large flashing warning above your character tells you what to do right now: BLINK AWAY when he is close, SHEEP HIM NOW at range (Polymorph works through Freedom), ICE BLOCK when you are low, and FREEDOM GONE - NOVA HIM when it ends. A warning sound plays whenever the advice changes.",
+        TGT.ApplyConfig)
 end
 
 function UI.BuildInfoPanel(panel)

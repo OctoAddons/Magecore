@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.0
+- New **Freedom coach** (PvP tab, on by default): while your enemy player target has Blessing of Freedom or a Free Action potion, a large flashing warning above your character tells you what to do right now, with a warning sound whenever the advice changes:
+  - **FREEDOM - BLINK AWAY!** when he is within 10 yards and Blink is ready.
+  - **FREEDOM - SHEEP HIM NOW!** at range with Polymorph ready, because Polymorph works through Freedom.
+  - **FREEDOM - ICE BLOCK!** when he is close, Blink is down and you are below half health.
+  - **FREEDOM - SHIELD UP, FIRE BLAST!** or **KEEP YOUR DISTANCE** otherwise.
+  - **FREEDOM GONE - NOVA HIM!** (or **SLOW HIM!** at range) for a few seconds after it ends.
+  - `/mc tcast test` now also shows the coach warnings.
+- `/mc tcast debug` also lists the last spells your target was seen casting and the cooldowns MageCore has recorded for it, to find out why Enemy cooldowns stay empty.
+
+
 ## 1.14.0
 - **One lock for all frames**: a new **Unlock frames / Lock frames** button at the top of the MageCore window (on every tab), plus `/mc unlock`, `/mc lock` and `/mc move` (toggle), unlocks or locks the XP bar, the target cast bar with its alert and cooldown icons, and the HUD together. Unlocking closes the window so it does not cover them.
 - The separate lock checkboxes and Move buttons on the Bars and HUD tabs are gone. The old `lock`, `unlock` and `move` subcommands of `/mc xp`, `/mc tcast` and `/mc hud` now use the shared lock.
