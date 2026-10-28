@@ -6,7 +6,7 @@ if playerClass ~= "MAGE" then return end
 
 -- Kept in the code as well as in MageCore.toc: the client reads the .toc
 -- only when the game starts, so a /reload would show an old version.
-local VERSION = "1.15.0"
+local VERSION = "1.16.0"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
@@ -1614,7 +1614,9 @@ function NP.UpdateFrostNovaRangeIndicators()
     end
     NP.ApplyTargetOnlyNameplateVisibility(false)
 
-    if not MageCore_Config.FrostNovaRange then
+    local novaRange = MageCore_Config.FrostNovaRange
+    local enemyBorder = MageCore_Config.EnemyNameplateBorder
+    if not novaRange and not enemyBorder then
         NP.HideFrostNovaRangeIndicators()
         return
     end
@@ -1622,18 +1624,29 @@ function NP.UpdateFrostNovaRangeIndicators()
     for parent, entry in pairs(S.frostNovaNameplates) do
         local anchor = NP.GetNameplateHealthBar(parent, entry)
         local unit = parent:IsShown() and entry.unit
-        -- Only enemies you can actually reach with Frost Nova are marked;
-        -- an outline on every distant enemy was noise, not information.
-        if entry.plateVisible and parent:IsShown()
+        local hostile = entry.plateVisible and parent:IsShown()
             and entry.disposition == "HOSTILE"
-            and unit and NP.IsUnitInFrostNovaRange(unit) then
+        if hostile and novaRange and unit and NP.IsUnitInFrostNovaRange(unit) then
+            -- Inside Frost Nova range: a thicker bright green outline.
             NP.SetFrostNovaBorderThickness(entry, anchor, 2)
             NP.SetFrostNovaBorderColor(entry, 0.2, 1, 0.2)
+            entry.border:Show()
+        elseif hostile and enemyBorder and unit
+            and NP.IsEnemyPlayerUnit(unit) then
+            -- Every other enemy player: a thin red outline, so the bar can
+            -- keep pfUI's class colour and still read as an enemy.
+            NP.SetFrostNovaBorderThickness(entry, anchor, 1)
+            NP.SetFrostNovaBorderColor(entry, 1, 0.1, 0.1)
             entry.border:Show()
         else
             entry.border:Hide()
         end
     end
+end
+
+function NP.IsEnemyPlayerUnit(unit)
+    local ok, isPlayer = pcall(UnitIsPlayer, unit)
+    return ok and isPlayer
 end
 
 local function IsHealingSpellName(spellName)
@@ -2043,6 +2056,10 @@ local function LoadDefaults()
     end
     if MageCore_Config.NoSlowAlert == nil then MageCore_Config.NoSlowAlert = true end
     if MageCore_Config.FreedomCoach == nil then MageCore_Config.FreedomCoach = true end
+    if MageCore_Config.AutoGreedGreens == nil then MageCore_Config.AutoGreedGreens = true end
+    if MageCore_Config.EnemyNameplateBorder == nil then
+        MageCore_Config.EnemyNameplateBorder = true
+    end
     if MageCore_Config.HUDShown == nil then MageCore_Config.HUDShown = true end
     if MageCore_Config.HUDLocked == nil then MageCore_Config.HUDLocked = true end
     if MageCore_Config.HUDX == nil then MageCore_Config.HUDX = 0 end
@@ -3211,6 +3228,12 @@ local function AcquireEnemyTarget()
     TargetNearestEnemy()
     if not (MageCore_Config.PvPMode and MageCore_Config.PvPTargetPlayersOnly) then
         return
+    end
+    -- Dungeons and raids hold no enemy players, so "Players only" would
+    -- never find a target there; pick the nearest enemy as usual.
+    if IsInInstance then
+        local _, instanceType = IsInInstance()
+        if instanceType == "party" or instanceType == "raid" then return end
     end
     local firstKey
     local i
@@ -5170,6 +5193,61 @@ function XP.Command(argument)
 end
 
 -- ---------------------------------------------------------------------------
+-- Auto greed: in group loot, green (uncommon) items get a Greed roll at once,
+-- bind-on-pickup ones included. Blue and better are left to the player.
+-- ---------------------------------------------------------------------------
+local LOOT = { QUALITY_UNCOMMON = 2, ROLL_GREED = 2 }
+
+function LOOT.OnStartRoll()
+    EnsureConfig()
+    if not MageCore_Config.AutoGreedGreens then return end
+    local rollID = arg1
+    local _, name, _, quality, bindOnPickUp = GetLootRollItemInfo(rollID)
+    if quality ~= LOOT.QUALITY_UNCOMMON then return end
+    RollOnLoot(rollID, LOOT.ROLL_GREED)
+    local ok, link = pcall(GetLootRollItemLink, rollID)
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r Greed on "
+        .. ((ok and link) or name or "item")
+        .. (bindOnPickUp and " (bind on pickup)" or "") .. ".")
+    -- For a bind-on-pickup item the client asks for a confirmation; accept
+    -- that popup for this roll only. The default roll window may also open
+    -- after this handler, so it is hidden on the next frames.
+    LOOT.rollID = rollID
+    LOOT.confirm = bindOnPickUp
+    LOOT.stopTime = GetTime() + 1.5
+    LOOT.frame:SetScript("OnUpdate", LOOT.AfterRoll)
+end
+
+function LOOT.AfterRoll()
+    local i
+    if LOOT.confirm then
+        for i = 1, STATICPOPUP_NUMDIALOGS or 4 do
+            local popup = getglobal("StaticPopup" .. i)
+            if popup and popup:IsShown() and popup.which == "CONFIRM_LOOT_ROLL"
+                and (popup.data == nil or popup.data == LOOT.rollID) then
+                local accept = getglobal("StaticPopup" .. i .. "Button1")
+                if accept then accept:Click() end
+                LOOT.confirm = nil
+            end
+        end
+    end
+    for i = 1, NUM_GROUP_LOOT_FRAMES or 4 do
+        local rollFrame = getglobal("GroupLootFrame" .. i)
+        if rollFrame and rollFrame:IsShown()
+            and rollFrame.rollID == LOOT.rollID then
+            rollFrame:Hide()
+        end
+    end
+    if GetTime() > LOOT.stopTime then
+        LOOT.frame:SetScript("OnUpdate", nil)
+    end
+end
+
+LOOT.frame = CreateFrame("Frame")
+LOOT.frame:RegisterEvent("START_LOOT_ROLL")
+LOOT.frame:SetScript("OnEvent", LOOT.OnStartRoll)
+
+-- ---------------------------------------------------------------------------
 -- One lock for every movable MageCore frame: the XP bar, the target cast bar
 -- with its alert and cooldown icons, and the HUD. Unlocking closes the menu,
 -- which would otherwise cover the frames in the middle of the screen.
@@ -6276,7 +6354,7 @@ function UI.BuildPvPPanel(panel)
 
     UI.MakeToggleButton(panel, 180, 210, -120, "Players only",
         "PvPTargetPlayersOnly", "Auto Target: players only",
-        "In PvP Mode, Auto Target cycles through nearby enemies and only picks a living player, skipping NPCs, pets and totems. If no enemy player is near, the target is cleared and nothing is cast. Outside PvP Mode, Auto Target picks the nearest enemy as usual. Auto Target itself is switched on or off on the Extra tab.")
+        "In PvP Mode, Auto Target cycles through nearby enemies and only picks a living player, skipping NPCs, pets and totems. If no enemy player is near, the target is cleared and nothing is cast. In dungeons and raids, and outside PvP Mode, Auto Target picks the nearest enemy as usual. Auto Target itself is switched on or off on the Extra tab.")
     UI.MakeToggleButton(panel, 180, 18, -165, "Counterspell", "AutoCounterspell",
         "Counterspell",
         "When your current enemy target is casting an interruptible spell, Rotation uses Counterspell before all other actions.")
@@ -6359,7 +6437,8 @@ function UI.BuildInfoPanel(panel)
     local novaButton = UI.MakeToggleButton(panel, 160, 18, -115, "Nova Range",
         "FrostNovaRange", nil, nil,
         function()
-            if not MageCore_Config.FrostNovaRange then
+            if not MageCore_Config.FrostNovaRange
+                and not MageCore_Config.EnemyNameplateBorder then
                 NP.HideFrostNovaRangeIndicators()
             end
         end)
@@ -6367,10 +6446,19 @@ function UI.BuildInfoPanel(panel)
     novaButton:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Frost Nova Range")
-        GameTooltip:AddLine("Shows a steady red border around hostile nameplates at longer range, then changes to a double-thickness bright green border inside Frost Nova's detected " .. S.frostNovaRangeYards .. "-yard range. Arctic Reach rank " .. S.arcticReachRank .. "/2 is detected from your spellbook. SuperWoW enables range detection for every nameplate; without it, the current target can change to the green state.", 0.8, 0.8, 0.8, 1, true)
+        GameTooltip:AddLine("Gives hostile nameplates a double-thickness bright green border inside Frost Nova's detected " .. S.frostNovaRangeYards .. "-yard range. Arctic Reach rank " .. S.arcticReachRank .. "/2 is detected from your spellbook. SuperWoW enables range detection for every nameplate; without it, the current target can change to the green state.", 0.8, 0.8, 0.8, 1, true)
         GameTooltip:Show()
     end)
     novaButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    UI.MakeToggleButton(panel, 160, 205, -115, "Enemy border",
+        "EnemyNameplateBorder", "Enemy border",
+        "Draws a thin red outline around the nameplates of enemy players, so you can tell enemies from your team while the bar keeps its class colour from pfUI. Inside Frost Nova range the outline turns thick and green (Nova Range). Leave 'Red enemies / green team' off to keep the class colours.",
+        function()
+            if not MageCore_Config.EnemyNameplateBorder
+                and not MageCore_Config.FrostNovaRange then
+                NP.HideFrostNovaRangeIndicators()
+            end
+        end)
 
     local reload = CreateFrame("Button", nil, panel)
     reload:SetWidth(160)
@@ -6511,7 +6599,7 @@ function UI.BuildExtraPanel(panel)
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -8)
     title:SetText(ACCENT .. "Extra|r")
-    UI.AddHelpText(panel, 18, -40, "Optional automation for the Rotation button. Each option is off by default except Auto Target.")
+    UI.AddHelpText(panel, 18, -40, "Optional automation. Each option is off by default except Auto Target, Surge on proc and Auto greed greens.")
 
     UI.MakeToggleButton(panel, 150, 225, -75, "Surge on proc",
         "AutoArcaneSurge", "Arcane Surge on proc",
@@ -6532,16 +6620,20 @@ function UI.BuildExtraPanel(panel)
     UI.MakeNumberBox(panel, "MageCoreShieldHealthPercent", 240, -169, 60,
         "At health %:", "DefensiveShieldHealthPercent", 1, 100, 40)
 
+    UI.MakeToggleButton(panel, 200, 18, -222, "Auto greed greens",
+        "AutoGreedGreens", "Auto greed greens",
+        "In group loot, MageCore rolls Greed on every green item at once, also bind-on-pickup greens (it accepts their bind confirmation), and hides the roll window. Blue, purple and orange items are left for you to decide. Each auto greed is written in chat.")
+
     local profileTitle = panel:CreateFontString(
         nil, "OVERLAY", "GameFontNormal")
-    profileTitle:SetPoint("TOPLEFT", 18, -232)
+    profileTitle:SetPoint("TOPLEFT", 18, -267)
     profileTitle:SetText(ACCENT .. "Profiles|r")
-    UI.AddHelpText(panel, 18, -252,
+    UI.AddHelpText(panel, 18, -287,
         "|cffffffff/mc profile save <name>|r  saves rotation, buffs and combat toggles\n"
         .. "|cffffffff/mc profile load <name>|r  restores them\n"
         .. "|cffffffff/mc profile delete <name>|r,  |cffffffff/mc profile list|r\n"
         .. "|cffffffff/mc reset|r  restores default settings (profiles are kept)")
-    local saved = UI.AddHelpText(panel, 18, -330, "")
+    local saved = UI.AddHelpText(panel, 18, -357, "")
     local function RefreshSaved()
         saved:SetText("Saved profiles: |cffffffff" .. UI.GetProfileNamesText() .. "|r")
     end

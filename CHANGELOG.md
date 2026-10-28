@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.16.0
+- New **Auto greed greens** (Extra tab, on by default): in group loot, MageCore rolls Greed on every green item at once, including bind-on-pickup dungeon greens (it accepts the bind confirmation for that roll), hides its roll window and writes the item in chat. Blue, purple and orange items still show the normal roll window so you decide.
+- New **Enemy border** (Info tab, on by default): a thin red outline around the nameplates of enemy players, so you can tell enemies from your team while the bar keeps its class colour from pfUI. Inside Frost Nova range the outline still turns thick and green. Leave **Red enemies / green team** off to keep the class colours.
+- Fixed: with PvP Mode and **Players only** on, a Rotation press without a target found nothing in dungeons, because only enemy players were accepted. Players only is now ignored in dungeons and raids, so Auto Target picks the nearest enemy there; battlegrounds and the open world are unchanged.
+
 ## 1.15.0
 - New **Freedom coach** (PvP tab, on by default): while your enemy player target has Blessing of Freedom or a Free Action potion, a large flashing warning above your character tells you what to do right now, with a warning sound whenever the advice changes:
   - **FREEDOM - BLINK AWAY!** when he is within 10 yards and Blink is ready.
