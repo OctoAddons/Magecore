@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.10.0
+- New **Target cast bar** (Bars tab, on by default): a large movable bar showing what your current target is casting, with spell icon, name and remaining time. Gold while casting, green while channeling, red when interrupted. Uses SuperWoW for exact cast times and falls back to pfUI/ShaguTweaks cast data. Unlock it on the Bars tab to drag it, with a size slider (50–200%). `/mc tcast on/off/lock/unlock/reset`.
+- New **No-slow alert** (PvP tab, on by default): a large warning with the buff icon above the target cast bar while your enemy target cannot be slowed or rooted. **NO SLOW** for Blessing of Freedom and Free Action potions, **IMMUNE** for Divine Shield, Divine Protection and Ice Block. Wait for it to disappear before using Frost Nova.
+- PvP Mode no longer spends its Rank 1 Frostbolt slow on a target with Freedom or an immunity.
+- **PvP Burst** is now called **Burst Mode**, because it overrides your normal Rotation slots. Your setting is kept. New `/mc burst` (and `/mc burst on/off`) switches it from a macro.
+- Burst Mode now ends with **Arcane Explosion** while the target is within 10 yards. It comes after the PvP Frostbolt logic, so a Rank 1 slow or a Frostbolt on a frozen target is still cast first. It does not need a Rotation slot.
+
+## 1.9.3
+- **PvP Trinket** (PvP tab, on by default): in PvP Mode, a Rotation or Arcane Explosion press uses your equipped Insignia or Medallion first whenever you are stunned, feared, polymorphed, charmed, sapped, blinded or otherwise lose control and the trinket is ready. Slows and roots do not use it, so the 5-minute cooldown is saved for real crowd control.
+
 ## 1.9.2
 - **Players only** (PvP tab, on by default): in PvP Mode, Auto Target cycles through nearby enemies and only picks a living player, skipping NPCs, pets and totems. With no enemy player nearby, the target is cleared and nothing is cast. Applies to the Rotation and R1 Frostbolt buttons.
 

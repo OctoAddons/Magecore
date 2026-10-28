@@ -577,6 +577,33 @@ local function HasLivingEnemyTarget()
         and not UnitIsDeadOrGhost("target")
 end
 
+-- Target buffs that stop Frost Nova, Frostbolt slows and Cone of Cold.
+-- FREEDOM only removes movement effects; IMMUNE blocks every spell.
+local SLOW_IMMUNITY_BUFFS = {
+    ["blessing of freedom"] = "FREEDOM", ["hand of freedom"] = "FREEDOM",
+    ["free action"] = "FREEDOM", ["living free action"] = "FREEDOM",
+    ["divine shield"] = "IMMUNE", ["divine protection"] = "IMMUNE",
+    ["ice block"] = "IMMUNE"
+}
+
+-- Returns the buff name, its icon path and "FREEDOM"/"IMMUNE" while the
+-- current enemy target cannot be slowed or rooted.
+local function GetTargetSlowImmunity()
+    if not HasLivingEnemyTarget() then return nil end
+    local auras = GetUnitAuras("target")
+    local i
+    for i = 1, table.getn(auras) do
+        local aura = auras[i]
+        local kind = aura.name and SLOW_IMMUNITY_BUFFS[string.lower(aura.name)]
+        if kind then
+            return aura.name,
+                aura.texture and ("Interface\\Icons\\" .. aura.texture),
+                kind
+        end
+    end
+    return nil
+end
+
 -- Nameplate features (Nova Range, scaling, target border, team colors) live
 -- in one table to stay under Vanilla Lua's 200-local limit for the file.
 local NP = {}
@@ -1969,6 +1996,7 @@ local function LoadDefaults()
     if MageCore_Config.PvPTargetPlayersOnly == nil then
         MageCore_Config.PvPTargetPlayersOnly = true
     end
+    if MageCore_Config.PvPTrinket == nil then MageCore_Config.PvPTrinket = true end
     if MageCore_Config.AutoArcaneSurge == nil then
         MageCore_Config.AutoArcaneSurge = true
     end
@@ -1998,6 +2026,18 @@ local function LoadDefaults()
     if MageCore_Config.CastBarX == nil then MageCore_Config.CastBarX = 0 end
     if MageCore_Config.CastBarY == nil then MageCore_Config.CastBarY = -150 end
     if MageCore_Config.CastBarScale == nil then MageCore_Config.CastBarScale = 100 end
+    if MageCore_Config.TargetCastBarShown == nil then
+        MageCore_Config.TargetCastBarShown = true
+    end
+    if MageCore_Config.TargetCastBarLocked == nil then
+        MageCore_Config.TargetCastBarLocked = true
+    end
+    if MageCore_Config.TargetCastBarX == nil then MageCore_Config.TargetCastBarX = 0 end
+    if MageCore_Config.TargetCastBarY == nil then MageCore_Config.TargetCastBarY = -100 end
+    if MageCore_Config.TargetCastBarScale == nil then
+        MageCore_Config.TargetCastBarScale = 100
+    end
+    if MageCore_Config.NoSlowAlert == nil then MageCore_Config.NoSlowAlert = true end
     MageCore_Config.WaterMaximum = math.max(
         tonumber(MageCore_Config.WaterMinimum) or 0,
         tonumber(MageCore_Config.WaterMaximum) or 0
@@ -2566,6 +2606,32 @@ local function GetPvpBurstSpell()
     return nil
 end
 
+-- Last step of the PvP burst: Arcane Explosion while the target stands
+-- inside its fixed 10-yard radius (Arctic Reach does not change it). It runs
+-- after the PvP Frostbolt logic so a Rank 1 slow or a shatter Frostbolt on a
+-- frozen target still comes first. No facing is needed.
+local function GetPvpArcaneExplosionSpell()
+    local spellName = "Arcane Explosion"
+    if not MageCore_Config.PvPMode or not MageCore_Config.PvPBurst
+        or not HasLivingEnemyTarget()
+        or not GetSpellBookIndex(spellName) or not IsSpellReady(spellName)
+        or not HasEnoughManaForSpell(spellName) then
+        return nil
+    end
+    if UnitPosition then
+        local playerOK, playerX, playerY = pcall(UnitPosition, "player")
+        local unitOK, unitX, unitY = pcall(UnitPosition, "target")
+        if playerOK and unitOK and playerX and playerY and unitX and unitY then
+            local deltaX, deltaY = playerX - unitX, playerY - unitY
+            if deltaX * deltaX + deltaY * deltaY <= 100 then return spellName end
+        end
+    end
+    -- Index 3 is the ~10-yard duel distance.
+    local ok, inRange = pcall(CheckInteractDistance, "target", 3)
+    if ok and inRange then return spellName end
+    return nil
+end
+
 local RESLOW_SECONDS = 4
 
 local function GetPvpFrostboltSpell()
@@ -2582,6 +2648,8 @@ local function GetPvpFrostboltSpell()
         -- Frostbolt priority over the configured Fire rotation.
         spellName = "Frostbolt"
     elseif not frostEffect then
+        -- Freedom, Divine Shield or Ice Block: a Rank 1 slow is wasted.
+        if GetTargetSlowImmunity() then return nil end
         -- After the first Rank 1 on this target, "Re-slow" lets Rotation cast
         -- it again once the chill has worn off (at most every 4 seconds, so
         -- an immune or resisting target is not spammed).
@@ -2967,6 +3035,67 @@ local function FindReadyDefilersTalisman()
     return nil
 end
 
+-- Loss-of-control debuffs a PvP Insignia/Medallion can break: stuns, fears,
+-- horrors, polymorphs, charms and incapacitates. Slows and roots are left
+-- out on purpose so the 5-minute trinket is not spent on a Frostbolt chill.
+local LOSS_OF_CONTROL_DEBUFFS = {
+    ["hammer of justice"] = true, ["cheap shot"] = true,
+    ["kidney shot"] = true, ["bash"] = true, ["pounce"] = true,
+    ["charge stun"] = true, ["intercept stun"] = true,
+    ["concussion blow"] = true, ["war stomp"] = true, ["blackout"] = true,
+    ["impact"] = true, ["mace stun effect"] = true, ["stun"] = true,
+    ["intimidation"] = true, ["revenge stun"] = true,
+    ["starfire stun"] = true, ["improved concussive shot"] = true,
+    ["fear"] = true, ["psychic scream"] = true, ["howl of terror"] = true,
+    ["intimidating shout"] = true, ["death coil"] = true,
+    ["terrify"] = true, ["seduction"] = true, ["mind control"] = true,
+    ["polymorph"] = true, ["polymorph: pig"] = true,
+    ["polymorph: turtle"] = true, ["polymorph: cow"] = true,
+    ["sap"] = true, ["gouge"] = true, ["blind"] = true,
+    ["scatter shot"] = true, ["wyvern sting"] = true,
+    ["freezing trap effect"] = true, ["repentance"] = true,
+    ["hibernate"] = true
+}
+
+-- Equipped and ready PvP trinket slot while PvP Mode is on and the player is
+-- under a loss-of-control effect.
+local function FindPvpTrinketAction()
+    if not (MageCore_Config.PvPMode and MageCore_Config.PvPTrinket) then
+        return nil
+    end
+    local trinketSlot, slot
+    for slot = 13, 14 do
+        local link = GetInventoryItemLink("player", slot)
+        if link and (string.find(link, "Insignia of the", 1, true)
+            or string.find(link, "Medallion of the", 1, true)) then
+            local start, duration, enabled =
+                GetInventoryItemCooldown("player", slot)
+            local ready = not start or not duration
+                or start == 0 or duration == 0
+                or start + duration <= GetTime()
+            if ready and (enabled == nil or enabled ~= 0) then
+                trinketSlot = slot
+                break
+            end
+        end
+    end
+    if not trinketSlot or not spellScanTooltip.SetUnitDebuff then return nil end
+
+    local i
+    for i = 1, 16 do
+        if not UnitDebuff("player", i) then break end
+        spellScanTooltip:ClearLines()
+        local ok = pcall(spellScanTooltip.SetUnitDebuff,
+            spellScanTooltip, "player", i)
+        local nameLine = ok and getglobal("MageCoreSpellScanTooltipTextLeft1")
+        local debuffName = nameLine and nameLine:GetText()
+        if debuffName and LOSS_OF_CONTROL_DEBUFFS[string.lower(debuffName)] then
+            return trinketSlot
+        end
+    end
+    return nil
+end
+
 local function GetDefensiveShieldAction()
     if not MageCore_Config.AutoDefensiveShield
         or not UnitAffectingCombat("player") then return nil end
@@ -3024,8 +3153,12 @@ local function BuffAction(spellName, unit)
 end
 
 -- Shared by Rotation and the Arcane Explosion button: emergency healing,
--- channel protection, mana gem and Defiler's Talisman, in that order.
+-- PvP trinket, channel protection, mana gem and Defiler's Talisman, in that
+-- order. Breaking a stun or fear comes first: nothing else can be used.
 local function DecideEmergencyAndChannel(surgeIgnoresRotation)
+    local trinketSlot = FindPvpTrinketAction()
+    if trinketSlot then return { kind = "INVENTORY", slot = trinketSlot } end
+
     local bag, slot = FindBestHealingPotion()
     if bag then return { kind = "POTION", bag = bag, slot = slot } end
 
@@ -3141,6 +3274,8 @@ local function DecideRotation(execute)
     if pvpBurst then return SpellAction(pvpBurst, "COMBAT") end
     local pvpFrostbolt = GetPvpFrostboltSpell()
     if pvpFrostbolt then return SpellAction(pvpFrostbolt, "PVP") end
+    local pvpExplosion = GetPvpArcaneExplosionSpell()
+    if pvpExplosion then return SpellAction(pvpExplosion, "COMBAT") end
     local opener = GetOpenerSpell()
     if opener then return SpellAction(opener, "OPENER") end
     local evocation = GetEvocationAction()
@@ -3981,6 +4116,298 @@ function CB.Command(argument)
 end
 
 -- ---------------------------------------------------------------------------
+-- Target cast bar and no-slow alert, moved together as one frame. The bar
+-- shows what the current target is casting; the alert above it names a buff
+-- that makes the target immune to slows and roots. SuperWoW's UNIT_CASTEVENT
+-- gives exact casts per GUID; without it the UnitCastingInfo providers used
+-- for Counterspell are asked instead.
+-- ---------------------------------------------------------------------------
+local TGT = { casts = {}, pruneTime = 0 }
+
+function TGT.OnCastEvent()
+    -- arg1 caster GUID, arg3 START/CHANNEL/CAST/FAIL, arg4 spell id, arg5 ms.
+    local guid, kind = arg1, arg3
+    if not guid then return end
+    local now = GetTime()
+    if kind == "START" or kind == "CHANNEL" then
+        local name, texture
+        if SpellInfo then
+            local ok, spellName, _, spellTexture = pcall(SpellInfo, arg4)
+            if ok then name, texture = spellName, spellTexture end
+        end
+        TGT.casts[guid] = {
+            name = name or "", texture = texture,
+            startTime = now,
+            endTime = now + math.max(0.1, (tonumber(arg5) or 0) / 1000),
+            channel = kind == "CHANNEL"
+        }
+    elseif kind == "CAST" or kind == "FAIL" then
+        local cast = TGT.casts[guid]
+        -- A channel can report CAST once it starts ticking; keep it running.
+        if cast and not cast.finished
+            and not (cast.channel and kind == "CAST") then
+            cast.finished = kind
+            cast.finishTime = now
+        end
+    end
+    if now > TGT.pruneTime then
+        TGT.pruneTime = now + 10
+        local key, cast
+        for key, cast in pairs(TGT.casts) do
+            if now > cast.endTime + 2 then TGT.casts[key] = nil end
+        end
+    end
+end
+
+function TGT.QueryProviders()
+    local providers = {}
+    if UnitCastingInfo then
+        table.insert(providers, { UnitCastingInfo, false })
+    end
+    if ShaguTweaks and ShaguTweaks.UnitCastingInfo
+        and ShaguTweaks.UnitCastingInfo ~= UnitCastingInfo then
+        table.insert(providers, { ShaguTweaks.UnitCastingInfo, false })
+    end
+    if UnitChannelInfo then
+        table.insert(providers, { UnitChannelInfo, true })
+    end
+    if ShaguTweaks and ShaguTweaks.UnitChannelInfo
+        and ShaguTweaks.UnitChannelInfo ~= UnitChannelInfo then
+        table.insert(providers, { ShaguTweaks.UnitChannelInfo, true })
+    end
+    local _, entry
+    for _, entry in ipairs(providers) do
+        local ok, name, _, _, texture, startMs, endMs = pcall(entry[1], "target")
+        if ok and name and tonumber(startMs) and tonumber(endMs) then
+            return {
+                name = name, texture = texture,
+                startTime = startMs / 1000, endTime = endMs / 1000,
+                channel = entry[2]
+            }
+        end
+    end
+    return nil
+end
+
+function TGT.GetTargetCast()
+    if not UnitExists("target") or UnitIsDeadOrGhost("target") then
+        return nil
+    end
+    local _, guid = UnitExists("target")
+    local cast = guid and TGT.casts[guid]
+    if cast then
+        local now = GetTime()
+        if cast.finished then
+            if now - cast.finishTime < 0.5 then return cast end
+        elseif now <= cast.endTime + 0.2 then
+            return cast
+        end
+    end
+    return TGT.QueryProviders()
+end
+
+function TGT.UpdateCastBar(unlocked)
+    local box = S.targetBarFrame.cast
+    local cast = MageCore_Config.TargetCastBarShown and TGT.GetTargetCast()
+    if not cast then
+        if MageCore_Config.TargetCastBarShown and unlocked then
+            box.bar:SetMinMaxValues(0, 1)
+            box.bar:SetValue(0.6)
+            box.bar:SetStatusBarColor(1, 0.7, 0)
+            box.icon:SetTexture(ICON_PATH .. "Spell_Holy_FlashHeal")
+            box.name:SetText("Target cast bar - drag to move")
+            box.time:SetText("")
+            box.spark:Hide()
+            box:SetAlpha(1)
+            box:Show()
+        else
+            box:Hide()
+        end
+        return
+    end
+
+    local now = GetTime()
+    local duration = math.max(0.1, cast.endTime - cast.startTime)
+    box.bar:SetMinMaxValues(0, duration)
+    box.icon:SetTexture(cast.texture or GetSpellTextureByName(cast.name)
+        or ICON_PATH .. "INV_Misc_QuestionMark")
+    box:SetAlpha(1)
+    if cast.finished then
+        box.spark:Hide()
+        box.time:SetText("")
+        if cast.finished == "FAIL" then
+            box.bar:SetStatusBarColor(1, 0.15, 0.15)
+            box.name:SetText("Interrupted")
+        else
+            box.bar:SetValue(duration)
+            box.bar:SetStatusBarColor(0.2, 1, 0.2)
+            box.name:SetText(cast.name)
+        end
+        box:SetAlpha(math.max(0, 1 - (now - cast.finishTime) / 0.5))
+        box:Show()
+        return
+    end
+    local value
+    if cast.channel then
+        value = math.max(0, cast.endTime - now)
+        box.bar:SetStatusBarColor(0.2, 0.9, 0.3)
+    else
+        value = math.min(duration, math.max(0, now - cast.startTime))
+        box.bar:SetStatusBarColor(1, 0.7, 0)
+    end
+    box.bar:SetValue(value)
+    box.name:SetText(cast.name)
+    box.time:SetText(string.format("%.1f", math.max(0, cast.endTime - now)))
+    box.spark:SetPoint("CENTER", box.bar, "LEFT",
+        (box.bar:GetWidth() or 0) * value / duration, 0)
+    box.spark:Show()
+    box:Show()
+end
+
+function TGT.UpdateAlert(unlocked)
+    local alert = S.targetBarFrame.alert
+    if not MageCore_Config.NoSlowAlert then
+        alert:Hide()
+        return
+    end
+    local name, texture, kind = GetTargetSlowImmunity()
+    if not name and unlocked then
+        name, texture, kind = "Blessing of Freedom",
+            ICON_PATH .. "Spell_Holy_SealOfValor", "FREEDOM"
+    end
+    if not name then
+        alert:Hide()
+        return
+    end
+    alert.icon:SetTexture(texture or ICON_PATH .. "INV_Misc_QuestionMark")
+    if kind == "IMMUNE" then
+        alert.text:SetText("|cffff4444IMMUNE|r  " .. name)
+    else
+        alert.text:SetText("|cffff4444NO SLOW|r  " .. name)
+    end
+    alert:Show()
+end
+
+function TGT.OnUpdate()
+    local unlocked = not MageCore_Config.TargetCastBarLocked
+    TGT.UpdateCastBar(unlocked)
+    -- Aura lists are cached, but there is no need to look every frame.
+    local now = GetTime()
+    if now >= (TGT.nextAlertCheck or 0) then
+        TGT.nextAlertCheck = now + 0.1
+        TGT.UpdateAlert(unlocked)
+    end
+end
+
+function TGT.Create()
+    if S.targetBarFrame then return end
+    local frame = CreateFrame("Frame", "MageCoreTargetCastBar", UIParent)
+    S.targetBarFrame = frame
+    frame:SetWidth(260)
+    frame:SetHeight(22)
+    frame:SetFrameStrata("HIGH")
+    BARS.MakeMovable(frame, "TargetCastBar", "TargetCastBarLocked")
+
+    local box = CreateFrame("Frame", nil, frame)
+    frame.cast = box
+    box:SetAllPoints(frame)
+    box:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        tile = false, edgeSize = 1,
+        insets = { left = 0, right = 0, top = 0, bottom = 0 }
+    })
+    box:SetBackdropColor(0, 0, 0, 0.6)
+    box:SetBackdropBorderColor(0, 0, 0, 1)
+    box.icon = box:CreateTexture(nil, "ARTWORK")
+    box.icon:SetWidth(22)
+    box.icon:SetHeight(22)
+    box.icon:SetPoint("RIGHT", box, "LEFT", -2, 0)
+    box.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    box.bar = CreateFrame("StatusBar", nil, box)
+    box.bar:SetPoint("TOPLEFT", 1, -1)
+    box.bar:SetPoint("BOTTOMRIGHT", -1, 1)
+    box.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    local overlay = CreateFrame("Frame", nil, box)
+    overlay:SetAllPoints(box)
+    overlay:SetFrameLevel(box.bar:GetFrameLevel() + 1)
+    box.spark = overlay:CreateTexture(nil, "OVERLAY")
+    box.spark:SetTexture("Interface\\CastingBar\\UI-CastingBar-Spark")
+    box.spark:SetBlendMode("ADD")
+    box.spark:SetWidth(20)
+    box.spark:SetHeight(38)
+    box.name = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    box.name:SetPoint("LEFT", 5, 0)
+    box.time = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    box.time:SetPoint("RIGHT", -5, 0)
+
+    local alert = CreateFrame("Frame", nil, frame)
+    frame.alert = alert
+    alert:SetWidth(260)
+    alert:SetHeight(24)
+    alert:SetPoint("BOTTOM", frame, "TOP", 0, 4)
+    alert.icon = alert:CreateTexture(nil, "ARTWORK")
+    alert.icon:SetWidth(24)
+    alert.icon:SetHeight(24)
+    alert.icon:SetPoint("LEFT", 0, 0)
+    alert.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    alert.text = alert:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    alert.text:SetPoint("LEFT", alert.icon, "RIGHT", 6, 0)
+
+    -- SuperWoW only; a plain client has no such event.
+    pcall(frame.RegisterEvent, frame, "UNIT_CASTEVENT")
+    frame:SetScript("OnEvent", TGT.OnCastEvent)
+    frame:SetScript("OnUpdate", TGT.OnUpdate)
+    frame:Hide()
+end
+
+function TGT.ApplyConfig()
+    local enabled = MageCore_Config.TargetCastBarShown
+        or MageCore_Config.NoSlowAlert
+    if not enabled then
+        if S.targetBarFrame then S.targetBarFrame:Hide() end
+        return
+    end
+    TGT.Create()
+    BARS.Apply(S.targetBarFrame, "TargetCastBar", -100)
+    -- The frame stays shown for its OnUpdate; it only catches the mouse
+    -- while unlocked so a locked, empty bar never blocks clicks.
+    S.targetBarFrame:EnableMouse(not MageCore_Config.TargetCastBarLocked)
+    S.targetBarFrame:Show()
+    TGT.OnUpdate()
+end
+
+function TGT.Command(argument)
+    EnsureConfig()
+    local message
+    if argument == "" then
+        MageCore_Config.TargetCastBarShown = not MageCore_Config.TargetCastBarShown
+    elseif argument == "on" then
+        MageCore_Config.TargetCastBarShown = true
+    elseif argument == "off" then
+        MageCore_Config.TargetCastBarShown = false
+    elseif argument == "lock" then
+        MageCore_Config.TargetCastBarLocked = true
+        message = "Target cast bar locked."
+    elseif argument == "unlock" then
+        MageCore_Config.TargetCastBarLocked = false
+        message = "Target cast bar unlocked. Drag it to move it."
+    elseif argument == "reset" then
+        MageCore_Config.TargetCastBarX = 0
+        MageCore_Config.TargetCastBarY = -100
+        MageCore_Config.TargetCastBarScale = 100
+        message = "Target cast bar position and size reset."
+    else
+        message = "Use |cffffffff/mc tcast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
+    end
+    TGT.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    message = message or ("Target cast bar " .. (MageCore_Config.TargetCastBarShown
+        and "|cff00ff00shown|r" or "|cffff4444hidden|r") .. ".")
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+-- ---------------------------------------------------------------------------
 -- Movable XP bar. Purple while rested XP is available, blue otherwise; the
 -- lighter overlay shows how far the rested bonus reaches. Hidden at max level.
 -- ---------------------------------------------------------------------------
@@ -4745,7 +5172,7 @@ local function GetProfileKeys()
         "CounterspellHealingOnly", "AutoFireWard", "FireWardMode",
         "TargetedMagicMode", "TargetedMagicValue", "TargetedMagicSavedName",
         "AutoTargetEnemy", "AutoArcaneSurge", "PvPBurst", "PvPReslow",
-        "PvPTargetPlayersOnly",
+        "PvPTargetPlayersOnly", "PvPTrinket",
         "AutoEvocation", "EvocationManaPercent",
         "AutoDefensiveShield", "DefensiveShieldHealthPercent"
     }
@@ -4779,6 +5206,7 @@ local function AfterSettingsChanged()
     NP.ApplyNameplateVisibility()
     XP.ApplyConfig()
     CB.ApplyConfig()
+    TGT.ApplyConfig()
 end
 
 local function ProfileCommand(subcommand, name)
@@ -4847,6 +5275,8 @@ local function PrintHelp()
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc profile save/load/delete <name>|r, |cffffffff/mc profile list|r")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc xp on/off/lock/unlock/reset|r  movable XP bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc cast on/off/lock/unlock/reset|r  movable cast bar")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast on/off/lock/unlock/reset|r  target cast bar and no-slow alert")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc burst [on/off]|r  switch Burst Mode (PvP Mode)")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc reset|r  restore default settings")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc debug|r, |cffffffff/mc ampdebug|r, |cffffffff/mc amptest|r, |cffffffff/mc platedebug|r")
 end
@@ -4865,8 +5295,22 @@ local function SlashCommand(message)
         ResetSettings()
     elseif command == "cast" or string.find(command, "^cast%s") then
         CB.Command((string.gsub(command, "^cast%s*", "")))
+    elseif command == "tcast" or string.find(command, "^tcast%s") then
+        TGT.Command((string.gsub(command, "^tcast%s*", "")))
     elseif command == "xp" or string.find(command, "^xp%s") then
         XP.Command((string.gsub(command, "^xp%s*", "")))
+    elseif command == "burst" or command == "burst on" or command == "burst off" then
+        -- Quick switch for a macro: /mc burst toggles, on/off set it.
+        EnsureConfig()
+        if command == "burst" then
+            MageCore_Config.PvPBurst = not MageCore_Config.PvPBurst
+        else
+            MageCore_Config.PvPBurst = command == "burst on"
+        end
+        UI.RefreshMenuControls()
+        Chat("Burst Mode " .. (MageCore_Config.PvPBurst
+            and "|cff00ff00on|r" or "|cffff4444off|r")
+            .. (MageCore_Config.PvPMode and "" or " (PvP Mode is off)") .. ".")
     elseif command == "help" then
         PrintHelp()
     elseif command == "box on" then
@@ -5200,13 +5644,13 @@ function UI.BuildPvPPanel(panel)
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -8)
     title:SetText(ACCENT .. "PvP|r")
-    UI.AddHelpText(panel, 18, -40, "PvP Burst and Re-slow only act while PvP Mode is on. Counterspell and Auto Wards work in every fight.")
+    UI.AddHelpText(panel, 18, -40, "Burst Mode and Re-slow only act while PvP Mode is on. Counterspell and Auto Wards work in every fight.")
 
     UI.MakeToggleButton(panel, 180, 18, -75, "PvP Mode", "PvPMode", "PvP Mode",
         "With an enemy targeted, skips maintenance, prioritizes your strongest Frostbolt while the target is frozen by Frost Nova, Frostbite, or Freeze, and uses Rank 1 Frostbolt to slow a target that has no chill or freeze (see Re-slow).")
-    UI.MakeToggleButton(panel, 180, 210, -75, "PvP Burst", "PvPBurst",
-        "PvP Burst",
-        "With PvP Mode on and an enemy targeted, Rotation casts Cone of Cold when the target is close enough, then Fire Blast when it is in range, before the PvP Frostbolt logic. Arcane Surge still comes first whenever it procs. After a \"target needs to be in front of you\" error, the burst pauses briefly so Cone of Cold is not wasted while the target is behind you.")
+    UI.MakeToggleButton(panel, 180, 210, -75, "Burst Mode", "PvPBurst",
+        "Burst Mode",
+        "Overrides your normal Rotation slots. With PvP Mode on and an enemy targeted, Rotation casts Cone of Cold when the target is close enough, then Fire Blast when it is in range, before the PvP Frostbolt logic. After that logic, Arcane Explosion is used while the target is within 10 yards. Arcane Surge still comes first whenever it procs. After a \"target needs to be in front of you\" error, the burst pauses briefly so Cone of Cold is not wasted while the target is behind you. Turn it off to keep PvP Mode's Frostbolt slows but use your own Rotation slots. |cffffffff/mc burst|r switches it from a macro.")
     UI.MakeToggleButton(panel, 180, 18, -120, "Re-slow", "PvPReslow",
         "Re-slow",
         "In PvP Mode, Rotation casts Rank 1 Frostbolt again on the same target once its chill has worn off, at most every 4 seconds. Turn it off to use Rank 1 only once per target.")
@@ -5251,7 +5695,15 @@ function UI.BuildPvPPanel(panel)
     UI.AddSimpleTooltip(modeButton, "Fire Ward Mode",
         "Smart uses Fire Ward proactively against Warlocks and remembers enemy Fire casts for two minutes. Mage/Warlock additionally pre-wards against all Mages. Frost Ward is always used against Shamans while Auto Wards is enabled. Counterspell remains the higher priority.")
 
-    UI.MakeDragButton(panel, 18, -280, "R1 Frostbolt",
+    UI.MakeToggleButton(panel, 180, 18, -255, "PvP Trinket", "PvPTrinket",
+        "PvP Trinket",
+        "In PvP Mode, a Rotation or Arcane Explosion press uses your equipped Insignia or Medallion first while you are stunned, feared, polymorphed, charmed, sapped or otherwise lose control, if the trinket is ready. Slows and roots do not trigger it.")
+    UI.MakeToggleButton(panel, 180, 210, -255, "No-slow alert", "NoSlowAlert",
+        "No-slow alert",
+        "Shows a large warning with the buff icon while your enemy target cannot be slowed or rooted: NO SLOW for Blessing of Freedom and Free Action, IMMUNE for Divine Shield, Divine Protection and Ice Block. Wait for it to disappear before you use Frost Nova. PvP Mode also skips its Rank 1 Frostbolt slow meanwhile. The alert sits above the target cast bar; unlock that bar on the Bars tab to move both.",
+        TGT.ApplyConfig)
+
+    UI.MakeDragButton(panel, 18, -305, "R1 Frostbolt",
         GetSpellTextureByName("Frostbolt") or ICON_PATH .. DEFAULT_ICON,
         function()
             local index = CreateOrUpdateMacro("MageSlow",
@@ -5263,7 +5715,7 @@ function UI.BuildPvPPanel(panel)
             "Rotation's PvP logic knows about it and will not repeat it right away.",
             "Drag onto an action bar."
         })
-    UI.AddHelpText(panel, 80, -285, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
+    UI.AddHelpText(panel, 80, -310, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
 end
 
 function UI.BuildInfoPanel(panel)
@@ -5392,10 +5844,26 @@ function UI.BuildBarsPanel(panel)
             return "Cast bar size: " .. value .. "%"
         end)
 
-    UI.AddHelpText(panel, 18, -280,
-        "|cffffffff/mc xp on/off/lock/unlock/reset|r\n"
-        .. "|cffffffff/mc cast on/off/lock/unlock/reset|r\n"
-        .. "Reset moves a bar back to the middle and restores 100% size.")
+    UI.MakeToggleButton(panel, 150, 18, -280, "Target Cast", "TargetCastBarShown",
+        "Target Cast Bar",
+        "Shows a large movable bar with what your current target is casting: spell icon, name and remaining time. Gold while casting, green while channeling, red when interrupted. The PvP tab's No-slow alert sits just above it and moves with it.",
+        TGT.ApplyConfig)
+    UI.MakeCheckBox(panel, "MageCoreTargetCastBarLockCheck", 185, -284,
+        "Lock target cast bar", "TargetCastBarLocked",
+        TGT.ApplyConfig,
+        "Lock target cast bar",
+        "While unlocked, the target cast bar and the no-slow alert show a preview so you can drag them into place.")
+    UI.MakeSlider(panel, "MageCoreTargetCastBarScaleSlider", 28, -335, 50, 200, 5,
+        "TargetCastBarScale", 100, "50%", "200%",
+        function(value)
+            if S.targetBarFrame then
+                BARS.Apply(S.targetBarFrame, "TargetCastBar", -100)
+            end
+            return "Target cast bar size: " .. value .. "%"
+        end)
+
+    UI.AddHelpText(panel, 18, -372,
+        "|cffffffff/mc xp|r, |cffffffff/mc cast|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset")
 end
 
 function UI.BuildExtraPanel(panel)
@@ -5628,6 +6096,7 @@ eventFrame:SetScript("OnEvent", function()
         LoadDefaults(); RefreshSpellBook(); CreateMinimapButton(); SetupRotationButtonTooltips()
         XP.ApplyConfig()
         CB.ApplyConfig()
+        TGT.ApplyConfig()
         if MageCore_Config.RotationBoxShown then
             CreateRotationBox()
             S.rotationBoxFrame:Show()
