@@ -160,6 +160,15 @@ local function NormalizeTexture(texture)
     return name and string.lower(name) or nil
 end
 
+-- SuperWoW's UnitExists returns the GUID, but builds differ in whether it
+-- comes first or second. Stock clients return no GUID at all.
+local function GetUnitGUID(unit)
+    local first, second = UnitExists(unit)
+    if type(second) == "string" then return second end
+    if type(first) == "string" then return first end
+    return nil
+end
+
 local function TooltipHasAny(spellIndex, hints)
     spellScanTooltip:ClearLines()
     spellScanTooltip:SetSpell(spellIndex, BOOKTYPE_SPELL)
@@ -1076,7 +1085,7 @@ function NP.IsCurrentTargetNameplate(parent, entry, unit)
     if unit == "target" then return true end
 
     if unit then
-        local _, targetGUID = UnitExists("target")
+        local targetGUID = GetUnitGUID("target")
         if targetGUID and unit == targetGUID then return true end
         if UnitIsUnit then
             local ok, matches = pcall(UnitIsUnit, unit, "target")
@@ -1644,7 +1653,7 @@ local function GetTargetCastingSpellInfo()
     -- libraries commonly accept a unit token or unit name. Try all three so
     -- Counterspell works with the native API, pfUI, and ShaguTweaks.
     local queries = {}
-    local _, targetGUID = UnitExists("target")
+    local targetGUID = GetUnitGUID("target")
     if targetGUID then table.insert(queries, targetGUID) end
     table.insert(queries, "target")
     local targetName = UnitName("target")
@@ -2038,6 +2047,12 @@ local function LoadDefaults()
         MageCore_Config.TargetCastBarScale = 100
     end
     if MageCore_Config.NoSlowAlert == nil then MageCore_Config.NoSlowAlert = true end
+    if MageCore_Config.EnemyCooldowns == nil then
+        MageCore_Config.EnemyCooldowns = true
+    end
+    if MageCore_Config.CounterspellLockout == nil then
+        MageCore_Config.CounterspellLockout = true
+    end
     MageCore_Config.WaterMaximum = math.max(
         tonumber(MageCore_Config.WaterMinimum) or 0,
         tonumber(MageCore_Config.WaterMaximum) or 0
@@ -3192,7 +3207,7 @@ local function AcquireEnemyTarget()
     for i = 1, 12 do
         if not UnitExists("target") then break end
         if HasLivingEnemyTarget() and UnitIsPlayer("target") then return end
-        local _, guid = UnitExists("target")
+        local guid = GetUnitGUID("target")
         local key = guid or GetTargetKey()
         if not firstKey then
             firstKey = key
@@ -4122,19 +4137,174 @@ end
 -- gives exact casts per GUID; without it the UnitCastingInfo providers used
 -- for Counterspell are asked instead.
 -- ---------------------------------------------------------------------------
-local TGT = { casts = {}, pruneTime = 0 }
+local TGT = { casts = {}, cooldowns = {}, lockouts = {}, pruneTime = 0 }
+
+-- Important PvP cooldowns, in seconds, without talent reductions. A used
+-- spell is shown under the target cast bar until it is ready again.
+TGT.COOLDOWNS = {
+    ["Divine Shield"] = 300, ["Divine Protection"] = 300,
+    ["Blessing of Protection"] = 300, ["Hammer of Justice"] = 60,
+    ["Lay on Hands"] = 3600, ["Repentance"] = 60, ["Divine Favor"] = 120,
+    ["Psychic Scream"] = 30, ["Silence"] = 45, ["Power Infusion"] = 180,
+    ["Inner Focus"] = 180, ["Fade"] = 30, ["Desperate Prayer"] = 600,
+    ["Vanish"] = 300, ["Evasion"] = 300, ["Blind"] = 300, ["Kick"] = 10,
+    ["Kidney Shot"] = 20, ["Gouge"] = 10, ["Sprint"] = 300,
+    ["Preparation"] = 600, ["Cold Blood"] = 180, ["Adrenaline Rush"] = 300,
+    ["Intercept"] = 30, ["Pummel"] = 10, ["Shield Bash"] = 12,
+    ["Intimidating Shout"] = 180, ["Berserker Rage"] = 30,
+    ["Death Wish"] = 180, ["Recklessness"] = 1800, ["Shield Wall"] = 1800,
+    ["Charge"] = 15, ["Concussion Blow"] = 45, ["Disarm"] = 60,
+    ["Ice Block"] = 300, ["Blink"] = 15, ["Counterspell"] = 30,
+    ["Frost Nova"] = 25, ["Cold Snap"] = 600, ["Presence of Mind"] = 180,
+    ["Arcane Power"] = 180, ["Combustion"] = 180, ["Evocation"] = 480,
+    ["Death Coil"] = 120, ["Howl of Terror"] = 40, ["Spell Lock"] = 24,
+    ["Shadowburn"] = 15, ["Fel Domination"] = 900,
+    ["Grounding Totem"] = 15, ["Nature's Swiftness"] = 180,
+    ["Mana Tide Totem"] = 300, ["Elemental Mastery"] = 180,
+    ["Bash"] = 60, ["Feral Charge"] = 15, ["Innervate"] = 360,
+    ["Barkskin"] = 60, ["Frenzied Regeneration"] = 180, ["Dash"] = 300,
+    ["Scatter Shot"] = 30, ["Freezing Trap"] = 15, ["Deterrence"] = 300,
+    ["Intimidation"] = 60, ["Wyvern Sting"] = 120, ["Rapid Fire"] = 300,
+    ["Feign Death"] = 30,
+    ["Will of the Forsaken"] = 120, ["Escape Artist"] = 60,
+    ["Perception"] = 180, ["Stoneform"] = 180, ["War Stomp"] = 120,
+    ["Berserking"] = 180
+}
+
+-- Spell school of common cast-time spells, for the Counterspell lockout.
+TGT.SCHOOLS = {
+    ["flash of light"] = "Holy", ["holy light"] = "Holy",
+    ["lesser heal"] = "Holy", ["heal"] = "Holy", ["greater heal"] = "Holy",
+    ["flash heal"] = "Holy", ["prayer of healing"] = "Holy",
+    ["holy fire"] = "Holy", ["smite"] = "Holy", ["resurrection"] = "Holy",
+    ["redemption"] = "Holy", ["exorcism"] = "Holy", ["holy wrath"] = "Holy",
+    ["healing wave"] = "Nature", ["lesser healing wave"] = "Nature",
+    ["chain heal"] = "Nature", ["lightning bolt"] = "Nature",
+    ["chain lightning"] = "Nature", ["healing touch"] = "Nature",
+    ["regrowth"] = "Nature", ["wrath"] = "Nature",
+    ["entangling roots"] = "Nature", ["hibernate"] = "Nature",
+    ["rebirth"] = "Nature", ["ancestral spirit"] = "Nature",
+    ["mind blast"] = "Shadow", ["mind flay"] = "Shadow",
+    ["mind control"] = "Shadow", ["shadow bolt"] = "Shadow",
+    ["drain life"] = "Shadow", ["drain mana"] = "Shadow",
+    ["drain soul"] = "Shadow", ["fear"] = "Shadow",
+    ["howl of terror"] = "Shadow", ["seduction"] = "Shadow",
+    ["fireball"] = "Fire", ["pyroblast"] = "Fire", ["flamestrike"] = "Fire",
+    ["scorch"] = "Fire", ["immolate"] = "Fire", ["soul fire"] = "Fire",
+    ["searing pain"] = "Fire", ["rain of fire"] = "Fire",
+    ["hellfire"] = "Fire",
+    ["frostbolt"] = "Frost", ["blizzard"] = "Frost",
+    ["polymorph"] = "Arcane", ["arcane missiles"] = "Arcane",
+    ["starfire"] = "Arcane"
+}
+TGT.LOCKOUT_SECONDS = 10
+
+-- /mc tcast test plays a fake fight against a Paladin so the bar, alert,
+-- lockout and cooldown icons can be seen without a real target: Holy Light
+-- is cast and interrupted, then Holy stays locked; Freedom turns into
+-- Divine Shield halfway through.
+TGT.TEST_SECONDS = 13
+
+function TGT.TestTime()
+    if not TGT.testStart then return nil end
+    local elapsed = GetTime() - TGT.testStart
+    if elapsed >= TGT.TEST_SECONDS then
+        TGT.testStart = nil
+        TGT.ApplyConfig()
+        return nil
+    end
+    return elapsed
+end
+
+function TGT.TestCast()
+    local elapsed = TGT.TestTime()
+    if not elapsed or elapsed >= 3 then return nil end
+    local start = TGT.testStart
+    local cast = { name = "Holy Light",
+        texture = ICON_PATH .. "Spell_Holy_HolyBolt",
+        startTime = start + 0.2, endTime = start + 2.7 }
+    if elapsed >= 2.5 then
+        cast.finished = "FAIL"
+        cast.finishTime = start + 2.5
+    end
+    return cast
+end
+
+function TGT.TestLockout()
+    local elapsed = TGT.TestTime()
+    if not elapsed or elapsed < 3 then return nil end
+    return { label = "Holy", texture = ICON_PATH .. "Spell_Holy_HolyBolt",
+        expires = TGT.testStart + 3 + TGT.LOCKOUT_SECONDS }
+end
+
+-- "You interrupt Bob's Flash Heal." Counterspell locks that school.
+function TGT.OnInterruptMessage(message)
+    if not MageCore_Config or not MageCore_Config.CounterspellLockout then
+        return
+    end
+    local _, _, unitName, spellName = string.find(message or "",
+        "^You interrupt (.-)%s*'s (.-)%.$")
+    if not unitName or not spellName then return end
+    local school = TGT.SCHOOLS[string.lower(spellName)]
+    local texture
+    if UnitName("target") == unitName then
+        local guid = GetUnitGUID("target")
+        local cast = guid and TGT.casts[guid]
+        texture = cast and cast.texture
+        if not school then
+            -- Every Paladin spell is Holy; other healers' heals follow class.
+            local _, class = UnitClass("target")
+            local isHeal = string.find(string.lower(spellName), "heal", 1, true)
+            if class == "PALADIN" or (class == "PRIEST" and isHeal) then
+                school = "Holy"
+            elseif (class == "SHAMAN" or class == "DRUID") and isHeal then
+                school = "Nature"
+            end
+        end
+    end
+    TGT.lockouts[unitName] = {
+        label = school or spellName, texture = texture,
+        startTime = GetTime(),
+        expires = GetTime() + TGT.LOCKOUT_SECONDS
+    }
+end
+
+function TGT.GetTargetLockout()
+    if TGT.testStart then return TGT.TestLockout() end
+    if not MageCore_Config.CounterspellLockout or not HasLivingEnemyTarget() then
+        return nil
+    end
+    local name = UnitName("target")
+    local lockout = name and TGT.lockouts[name]
+    if not lockout then return nil end
+    if GetTime() >= lockout.expires then
+        TGT.lockouts[name] = nil
+        return nil
+    end
+    return lockout
+end
 
 function TGT.OnCastEvent()
     -- arg1 caster GUID, arg3 START/CHANNEL/CAST/FAIL, arg4 spell id, arg5 ms.
     local guid, kind = arg1, arg3
     if not guid then return end
     local now = GetTime()
+    local name, texture
+    if SpellInfo and kind ~= "FAIL" then
+        local ok, spellName, _, spellTexture = pcall(SpellInfo, arg4)
+        if ok then name, texture = spellName, spellTexture end
+    end
+    -- For /mc tcast debug.
+    TGT.eventCount = (TGT.eventCount or 0) + 1
+    TGT.lastEvent = tostring(kind) .. " " .. tostring(name) .. " from " .. tostring(guid)
+    if (kind == "CAST" or kind == "CHANNEL") and name
+        and TGT.COOLDOWNS[name] then
+        TGT.cooldowns[guid] = TGT.cooldowns[guid] or {}
+        TGT.cooldowns[guid][name] = {
+            texture = texture, expires = now + TGT.COOLDOWNS[name]
+        }
+    end
     if kind == "START" or kind == "CHANNEL" then
-        local name, texture
-        if SpellInfo then
-            local ok, spellName, _, spellTexture = pcall(SpellInfo, arg4)
-            if ok then name, texture = spellName, spellTexture end
-        end
         TGT.casts[guid] = {
             name = name or "", texture = texture,
             startTime = now,
@@ -4155,6 +4325,18 @@ function TGT.OnCastEvent()
         local key, cast
         for key, cast in pairs(TGT.casts) do
             if now > cast.endTime + 2 then TGT.casts[key] = nil end
+        end
+        local spells, spellName, entry
+        for key, spells in pairs(TGT.cooldowns) do
+            local active = false
+            for spellName, entry in pairs(spells) do
+                if now >= entry.expires then
+                    spells[spellName] = nil
+                else
+                    active = true
+                end
+            end
+            if not active then TGT.cooldowns[key] = nil end
         end
     end
 end
@@ -4193,7 +4375,7 @@ function TGT.GetTargetCast()
     if not UnitExists("target") or UnitIsDeadOrGhost("target") then
         return nil
     end
-    local _, guid = UnitExists("target")
+    local guid = GetUnitGUID("target")
     local cast = guid and TGT.casts[guid]
     if cast then
         local now = GetTime()
@@ -4208,7 +4390,29 @@ end
 
 function TGT.UpdateCastBar(unlocked)
     local box = S.targetBarFrame.cast
-    local cast = MageCore_Config.TargetCastBarShown and TGT.GetTargetCast()
+    local cast
+    if TGT.testStart then
+        cast = TGT.TestCast()
+    else
+        cast = MageCore_Config.TargetCastBarShown and TGT.GetTargetCast()
+    end
+    local lockout = not cast and TGT.GetTargetLockout()
+    if lockout then
+        -- A purple bar drains while the interrupted school is locked.
+        local remaining = lockout.expires - GetTime()
+        box.bar:SetMinMaxValues(0, TGT.LOCKOUT_SECONDS)
+        box.bar:SetValue(remaining)
+        box.bar:SetStatusBarColor(0.6, 0.3, 1)
+        box.icon:SetTexture(lockout.texture
+            or GetSpellTextureByName("Counterspell")
+            or ICON_PATH .. "INV_Misc_QuestionMark")
+        box.name:SetText("LOCKED: " .. lockout.label)
+        box.time:SetText(string.format("%.1f", math.max(0, remaining)))
+        box.spark:Hide()
+        box:SetAlpha(1)
+        box:Show()
+        return
+    end
     if not cast then
         if MageCore_Config.TargetCastBarShown and unlocked then
             box.bar:SetMinMaxValues(0, 1)
@@ -4266,11 +4470,20 @@ end
 
 function TGT.UpdateAlert(unlocked)
     local alert = S.targetBarFrame.alert
-    if not MageCore_Config.NoSlowAlert then
+    local name, texture, kind
+    local elapsed = TGT.TestTime()
+    if elapsed and elapsed < 6 then
+        name, texture, kind = "Blessing of Freedom",
+            ICON_PATH .. "Spell_Holy_SealOfValor", "FREEDOM"
+    elseif elapsed then
+        name, texture, kind = "Divine Shield",
+            ICON_PATH .. "Spell_Holy_DivineIntervention", "IMMUNE"
+    elseif not MageCore_Config.NoSlowAlert then
         alert:Hide()
         return
+    else
+        name, texture, kind = GetTargetSlowImmunity()
     end
-    local name, texture, kind = GetTargetSlowImmunity()
     if not name and unlocked then
         name, texture, kind = "Blessing of Freedom",
             ICON_PATH .. "Spell_Holy_SealOfValor", "FREEDOM"
@@ -4288,6 +4501,65 @@ function TGT.UpdateAlert(unlocked)
     alert:Show()
 end
 
+TGT.MAX_COOLDOWN_ICONS = 8
+
+function TGT.UpdateCooldowns(unlocked)
+    local row = S.targetBarFrame.cds
+    local list = {}
+    local elapsed = TGT.TestTime()
+    if elapsed then
+        list = {
+            { texture = ICON_PATH .. "Spell_Holy_SealOfMight",
+                remaining = 45 - elapsed },
+            { texture = ICON_PATH .. "Spell_Holy_LayOnHands",
+                remaining = 3540 - elapsed }
+        }
+        if elapsed >= 6 then
+            table.insert(list, 2, { texture = ICON_PATH
+                .. "Spell_Holy_DivineIntervention", remaining = 306 - elapsed })
+        end
+    elseif MageCore_Config.EnemyCooldowns then
+        local now = GetTime()
+        local guid = GetUnitGUID("target")
+        local spells = HasLivingEnemyTarget() and guid and TGT.cooldowns[guid]
+        local spellName, entry
+        if spells then
+            for spellName, entry in pairs(spells) do
+                if entry.expires > now then
+                    table.insert(list, { texture = entry.texture,
+                        remaining = entry.expires - now })
+                end
+            end
+        elseif unlocked then
+            list = {
+                { texture = ICON_PATH .. "Spell_Holy_DivineIntervention",
+                    remaining = 272 },
+                { texture = ICON_PATH .. "Spell_Holy_SealOfMight",
+                    remaining = 41 }
+            }
+        end
+        table.sort(list, function(a, b) return a.remaining < b.remaining end)
+    end
+    local i
+    for i = 1, TGT.MAX_COOLDOWN_ICONS do
+        local icon = row.icons[i]
+        local entry = list[i]
+        if entry then
+            icon.texture:SetTexture(entry.texture
+                or ICON_PATH .. "INV_Misc_QuestionMark")
+            local seconds = math.ceil(entry.remaining)
+            if seconds >= 60 then
+                icon.text:SetText(math.floor(seconds / 60) .. "m")
+            else
+                icon.text:SetText(seconds)
+            end
+            icon:Show()
+        else
+            icon:Hide()
+        end
+    end
+end
+
 function TGT.OnUpdate()
     local unlocked = not MageCore_Config.TargetCastBarLocked
     TGT.UpdateCastBar(unlocked)
@@ -4296,6 +4568,7 @@ function TGT.OnUpdate()
     if now >= (TGT.nextAlertCheck or 0) then
         TGT.nextAlertCheck = now + 0.1
         TGT.UpdateAlert(unlocked)
+        TGT.UpdateCooldowns(unlocked)
     end
 end
 
@@ -4354,6 +4627,28 @@ function TGT.Create()
     alert.text = alert:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     alert.text:SetPoint("LEFT", alert.icon, "RIGHT", 6, 0)
 
+    -- Enemy cooldowns: a row of icons with time left, under the bar.
+    local row = CreateFrame("Frame", nil, frame)
+    frame.cds = row
+    row:SetWidth(260)
+    row:SetHeight(26)
+    row:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", 0, -4)
+    row.icons = {}
+    local i
+    for i = 1, TGT.MAX_COOLDOWN_ICONS do
+        local icon = CreateFrame("Frame", nil, row)
+        icon:SetWidth(26)
+        icon:SetHeight(26)
+        icon:SetPoint("LEFT", (i - 1) * 30, 0)
+        icon.texture = icon:CreateTexture(nil, "ARTWORK")
+        icon.texture:SetAllPoints(icon)
+        icon.texture:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        icon.text = icon:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        icon.text:SetPoint("CENTER", 0, 0)
+        icon:Hide()
+        row.icons[i] = icon
+    end
+
     -- SuperWoW only; a plain client has no such event.
     pcall(frame.RegisterEvent, frame, "UNIT_CASTEVENT")
     frame:SetScript("OnEvent", TGT.OnCastEvent)
@@ -4363,7 +4658,8 @@ end
 
 function TGT.ApplyConfig()
     local enabled = MageCore_Config.TargetCastBarShown
-        or MageCore_Config.NoSlowAlert
+        or MageCore_Config.NoSlowAlert or MageCore_Config.EnemyCooldowns
+        or MageCore_Config.CounterspellLockout
     if not enabled then
         if S.targetBarFrame then S.targetBarFrame:Hide() end
         return
@@ -4377,10 +4673,57 @@ function TGT.ApplyConfig()
     TGT.OnUpdate()
 end
 
+-- Unlock and close the menu, which otherwise covers the bar in the middle of
+-- the screen; a second call locks it again.
+function TGT.ToggleMove()
+    EnsureConfig()
+    MageCore_Config.TargetCastBarLocked = not MageCore_Config.TargetCastBarLocked
+    local message
+    if MageCore_Config.TargetCastBarLocked then
+        message = "Target cast bar locked."
+    else
+        if MageCoreMenuFrame then MageCoreMenuFrame:Hide() end
+        message = "Target cast bar unlocked. Drag it into place, then type "
+            .. "|cffffffff/mc tcast move|r again to lock it."
+    end
+    TGT.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
 function TGT.Command(argument)
     EnsureConfig()
     local message
-    if argument == "" then
+    if argument == "move" then
+        TGT.ToggleMove()
+        return
+    elseif argument == "test" then
+        TGT.Create()
+        BARS.Apply(S.targetBarFrame, "TargetCastBar", -100)
+        TGT.testStart = GetTime()
+        S.targetBarFrame:Show()
+        DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r Target cast bar test: "
+            .. TGT.TEST_SECONDS .. " seconds of a fake Paladin fight.")
+        return
+    elseif argument == "debug" then
+        local first, second = UnitExists("target")
+        local guid = GetUnitGUID("target")
+        local cast = TGT.GetTargetCast()
+        DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r tcast debug:"
+            .. " shown=" .. tostring(MageCore_Config.TargetCastBarShown)
+            .. ", frame=" .. tostring(S.targetBarFrame
+                and S.targetBarFrame:IsShown())
+            .. ", SpellInfo=" .. tostring(SpellInfo ~= nil))
+        DEFAULT_CHAT_FRAME:AddMessage("  UnitExists(target) = "
+            .. tostring(first) .. ", " .. tostring(second)
+            .. "; guid=" .. tostring(guid))
+        DEFAULT_CHAT_FRAME:AddMessage("  cast events=" .. tostring(TGT.eventCount or 0)
+            .. ", last=" .. tostring(TGT.lastEvent))
+        DEFAULT_CHAT_FRAME:AddMessage("  target cast now: "
+            .. (cast and (tostring(cast.name) .. " (" .. string.format("%.1f",
+                cast.endTime - GetTime()) .. "s)") or "none"))
+        return
+    elseif argument == "" then
         MageCore_Config.TargetCastBarShown = not MageCore_Config.TargetCastBarShown
     elseif argument == "on" then
         MageCore_Config.TargetCastBarShown = true
@@ -4398,7 +4741,7 @@ function TGT.Command(argument)
         MageCore_Config.TargetCastBarScale = 100
         message = "Target cast bar position and size reset."
     else
-        message = "Use |cffffffff/mc tcast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
+        message = "Use |cffffffff/mc tcast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r, |cffffffffreset|r, |cfffffffftest|r or |cffffffffdebug|r."
     end
     TGT.ApplyConfig()
     if UI.RefreshMenuControls then UI.RefreshMenuControls() end
@@ -5276,6 +5619,8 @@ local function PrintHelp()
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc xp on/off/lock/unlock/reset|r  movable XP bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc cast on/off/lock/unlock/reset|r  movable cast bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast on/off/lock/unlock/reset|r  target cast bar and no-slow alert")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast test|r  show a fake fight on the target cast bar")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast move|r  unlock the target cast bar to drag it, again to lock")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc burst [on/off]|r  switch Burst Mode (PvP Mode)")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc reset|r  restore default settings")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc debug|r, |cffffffff/mc ampdebug|r, |cffffffff/mc amptest|r, |cffffffff/mc platedebug|r")
@@ -5703,7 +6048,16 @@ function UI.BuildPvPPanel(panel)
         "Shows a large warning with the buff icon while your enemy target cannot be slowed or rooted: NO SLOW for Blessing of Freedom and Free Action, IMMUNE for Divine Shield, Divine Protection and Ice Block. Wait for it to disappear before you use Frost Nova. PvP Mode also skips its Rank 1 Frostbolt slow meanwhile. The alert sits above the target cast bar; unlock that bar on the Bars tab to move both.",
         TGT.ApplyConfig)
 
-    UI.MakeDragButton(panel, 18, -305, "R1 Frostbolt",
+    UI.MakeToggleButton(panel, 180, 18, -300, "Enemy cooldowns",
+        "EnemyCooldowns", "Enemy cooldowns",
+        "Shows a row of icons under the target cast bar with your enemy target's important cooldowns that it has used, such as Divine Shield, Vanish, Blink, Intercept or Psychic Scream, and the time until each is ready again. Times are base cooldowns, so talents can make the real cooldown a little shorter. Needs SuperWoW.",
+        TGT.ApplyConfig)
+    UI.MakeToggleButton(panel, 180, 210, -300, "CS lockout", "CounterspellLockout",
+        "Counterspell lockout",
+        "After your Counterspell interrupts the target, the target cast bar turns purple and shows which school is locked, for example LOCKED: Holy, with the seconds left. Then you know when a Paladin or Priest can heal again.",
+        TGT.ApplyConfig)
+
+    UI.MakeDragButton(panel, 18, -345, "R1 Frostbolt",
         GetSpellTextureByName("Frostbolt") or ICON_PATH .. DEFAULT_ICON,
         function()
             local index = CreateOrUpdateMacro("MageSlow",
@@ -5715,7 +6069,7 @@ function UI.BuildPvPPanel(panel)
             "Rotation's PvP logic knows about it and will not repeat it right away.",
             "Drag onto an action bar."
         })
-    UI.AddHelpText(panel, 80, -310, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
+    UI.AddHelpText(panel, 80, -350, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
 end
 
 function UI.BuildInfoPanel(panel)
@@ -5861,6 +6215,23 @@ function UI.BuildBarsPanel(panel)
             end
             return "Target cast bar size: " .. value .. "%"
         end)
+
+    local moveButton = CreateFrame("Button", nil, panel)
+    moveButton:SetWidth(90)
+    moveButton:SetHeight(26)
+    moveButton:SetPoint("TOPLEFT", 295, -327)
+    StyleButton(moveButton)
+    local moveText = moveButton:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    moveText:SetPoint("CENTER", 0, 0)
+    local function RefreshMove()
+        moveText:SetText(MageCore_Config.TargetCastBarLocked and "Move" or "Lock")
+    end
+    RefreshMove()
+    table.insert(S.menuRefreshers, RefreshMove)
+    moveButton:SetScript("OnClick", TGT.ToggleMove)
+    UI.AddSimpleTooltip(moveButton, "Move target cast bar",
+        "Closes this window and unlocks the target cast bar, the no-slow alert and the cooldown icons so you can drag them. Type |cffffffff/mc tcast move|r or press Lock here to lock them again.")
 
     UI.AddHelpText(panel, 18, -372,
         "|cffffffff/mc xp|r, |cffffffff/mc cast|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset")
@@ -6186,6 +6557,7 @@ eventFrame:SetScript("OnEvent", function()
         or event == "CHAT_MSG_SPELL_SELF_BUFF"
         or event == "CHAT_MSG_COMBAT_SELF_HITS" then
         ClearConfirmedLunaInterrupt(arg1)
+        TGT.OnInterruptMessage(arg1)
         if string.find(arg1 or "", "^You interrupt ", 1) then
             -- Repeat once on the next update in case Luna's event handler runs
             -- after MageCore's handler and redraws its cached cast.

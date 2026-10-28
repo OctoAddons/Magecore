@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.0
+- New **Enemy cooldowns** (PvP tab, on by default): a row of icons under the target cast bar shows the important cooldowns your enemy target has used, such as Divine Shield, Blessing of Protection, Hammer of Justice, Vanish, Blind, Blink, Ice Block, Intercept, Psychic Scream, Death Coil and racials, with the time until each is ready again. Times are base cooldowns without talents. Needs SuperWoW.
+- New **CS lockout** (PvP tab, on by default): after your Counterspell interrupts the target, the target cast bar turns purple and shows the locked school, for example **LOCKED: Holy**, with the seconds left.
+- Fixed: the target cast bar and Enemy cooldowns found no casts on SuperWoW builds that return the GUID as the first value of `UnitExists`. All target GUID lookups now accept both forms.
+- `/mc tcast debug` prints what the target cast bar sees, for troubleshooting.
+- New **Move** button next to the target cast bar size slider (Bars tab) and `/mc tcast move`: closes the MageCore window, which covered the bar, and unlocks the target cast bar so it can be dragged. Press it again or repeat the command to lock it.
+- `/mc tcast test` plays a 13-second fake Paladin fight on the target cast bar: Holy Light is cast and interrupted, Holy stays locked, the alert switches from Blessing of Freedom to Divine Shield and cooldown icons count down. No target is needed.
+
 ## 1.10.0
 - New **Target cast bar** (Bars tab, on by default): a large movable bar showing what your current target is casting, with spell icon, name and remaining time. Gold while casting, green while channeling, red when interrupted. Uses SuperWoW for exact cast times and falls back to pfUI/ShaguTweaks cast data. Unlock it on the Bars tab to drag it, with a size slider (50–200%). `/mc tcast on/off/lock/unlock/reset`.
 - New **No-slow alert** (PvP tab, on by default): a large warning with the buff icon above the target cast bar while your enemy target cannot be slowed or rooted. **NO SLOW** for Blessing of Freedom and Free Action potions, **IMMUNE** for Divine Shield, Divine Protection and Ice Block. Wait for it to disappear before using Frost Nova.
