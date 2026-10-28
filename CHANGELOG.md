@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.12.0
+- New **HUD** tab with a health arc on the left and a mana arc on the right of your character. Health turns from green to yellow to red as it drops, mana is blue, and both slide smoothly to their new value. It shows in combat, with an enemy targeted or while health or mana is not full, and fades out while idle. On by default; switch it off with the **HUD** toggle or `/mc hud off`.
+- HUD options: **Always show**, **Numbers** (percentages under the arcs), size (50–200%) and **Arc opacity** (5–100%) sliders, where opacity makes only the arcs see-through and the numbers stay readable (larger, with a black outline), and a **Move HUD** button. The HUD never catches mouse clicks unless it is unlocked.
+- `/mc hud on/off/move/reset`.
+- If the arc image has not been loaded yet, MageCore says so in chat: WoW must be restarted completely after installing a new image file; `/reload` is not enough.
+- The settings window is slightly wider to fit nine tabs.
+- The version shown in the window now comes from the code, so it is correct right after a `/reload`. Before, it came from `MageCore.toc`, which the client only reads when the game starts.
+
 ## 1.11.0
 - New **Enemy cooldowns** (PvP tab, on by default): a row of icons under the target cast bar shows the important cooldowns your enemy target has used, such as Divine Shield, Blessing of Protection, Hammer of Justice, Vanish, Blind, Blink, Ice Block, Intercept, Psychic Scream, Death Coil and racials, with the time until each is ready again. Times are base cooldowns without talents. Needs SuperWoW.
 - New **CS lockout** (PvP tab, on by default): after your Counterspell interrupts the target, the target cast bar turns purple and shows the locked school, for example **LOCKED: Holy**, with the seconds left.

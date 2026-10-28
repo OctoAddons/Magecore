@@ -4,9 +4,9 @@
 local _, playerClass = UnitClass("player")
 if playerClass ~= "MAGE" then return end
 
--- The version lives only in MageCore.toc.
-local VERSION = GetAddOnMetadata
-    and GetAddOnMetadata("MageCore", "Version") or "?"
+-- Kept in the code as well as in MageCore.toc: the client reads the .toc
+-- only when the game starts, so a /reload would show an old version.
+local VERSION = "1.12.0"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
@@ -2047,6 +2047,14 @@ local function LoadDefaults()
         MageCore_Config.TargetCastBarScale = 100
     end
     if MageCore_Config.NoSlowAlert == nil then MageCore_Config.NoSlowAlert = true end
+    if MageCore_Config.HUDShown == nil then MageCore_Config.HUDShown = true end
+    if MageCore_Config.HUDLocked == nil then MageCore_Config.HUDLocked = true end
+    if MageCore_Config.HUDX == nil then MageCore_Config.HUDX = 0 end
+    if MageCore_Config.HUDY == nil then MageCore_Config.HUDY = -20 end
+    if MageCore_Config.HUDScale == nil then MageCore_Config.HUDScale = 100 end
+    if MageCore_Config.HUDAlpha == nil then MageCore_Config.HUDAlpha = 80 end
+    if MageCore_Config.HUDAlwaysShow == nil then MageCore_Config.HUDAlwaysShow = false end
+    if MageCore_Config.HUDNumbers == nil then MageCore_Config.HUDNumbers = true end
     if MageCore_Config.EnemyCooldowns == nil then
         MageCore_Config.EnemyCooldowns = true
     end
@@ -4751,6 +4759,200 @@ function TGT.Command(argument)
 end
 
 -- ---------------------------------------------------------------------------
+-- HUD: a health arc on the left and a mana arc on the right of the screen
+-- centre, where the character stands. Both fill from the bottom up by
+-- cropping HUDArc.tga; the right arc is the same image mirrored. The HUD
+-- fades out while idle and never catches the mouse unless unlocked.
+-- ---------------------------------------------------------------------------
+local HUD = {
+    TEXTURE = "Interface\\AddOns\\MageCore\\HUDArc",
+    ARC_WIDTH = 32, ARC_HEIGHT = 128, GAP = 150,
+    alpha = 0, health = 1, mana = 1
+}
+
+function HUD.MakeArc(frame, point, mirrored)
+    local arc = {}
+    arc.back = frame:CreateTexture(nil, "BACKGROUND")
+    arc.back:SetTexture(HUD.TEXTURE)
+    arc.back:SetWidth(HUD.ARC_WIDTH)
+    arc.back:SetHeight(HUD.ARC_HEIGHT)
+    arc.back:SetPoint(point, frame, point, 0, 0)
+    arc.back:SetVertexColor(0, 0, 0, 0.5)
+    arc.fill = frame:CreateTexture(nil, "ARTWORK")
+    arc.fill:SetTexture(HUD.TEXTURE)
+    arc.fill:SetWidth(HUD.ARC_WIDTH)
+    arc.fill:SetPoint(point, frame, point, 0, 0)
+    -- A larger outlined font keeps the numbers readable over busy scenery
+    -- and nameplates, whatever the arc opacity is.
+    arc.text = frame:CreateFontString(nil, "OVERLAY")
+    arc.text:SetFont("Fonts\\FRIZQT__.TTF", 13, "OUTLINE")
+    arc.text:SetTextColor(1, 1, 1, 1)
+    arc.text:SetPoint("TOP", arc.back, "BOTTOM", 0, -3)
+    arc.mirrored = mirrored
+    if mirrored then arc.back:SetTexCoord(1, 0, 0, 1) end
+    return arc
+end
+
+-- Shows the bottom part of the arc image, so the fill follows the curve.
+function HUD.SetFill(arc, fraction)
+    fraction = math.max(0, math.min(1, fraction))
+    if fraction <= 0.005 then
+        arc.fill:Hide()
+        return
+    end
+    arc.fill:SetHeight(HUD.ARC_HEIGHT * fraction)
+    if arc.mirrored then
+        arc.fill:SetTexCoord(1, 0, 1 - fraction, 1)
+    else
+        arc.fill:SetTexCoord(0, 1, 1 - fraction, 1)
+    end
+    arc.fill:Show()
+end
+
+-- Shown in combat, while hurt or low on mana, with an enemy targeted, or
+-- always when "Always show" is on or the HUD is unlocked for moving.
+function HUD.IsWanted()
+    if UnitIsDeadOrGhost("player") then return false end
+    if not MageCore_Config.HUDLocked or MageCore_Config.HUDAlwaysShow then
+        return true
+    end
+    if UnitAffectingCombat("player") or HasLivingEnemyTarget() then
+        return true
+    end
+    return UnitHealth("player") < UnitHealthMax("player")
+        or UnitMana("player") < UnitManaMax("player")
+end
+
+function HUD.OnUpdate()
+    local elapsed = arg1 or 0.02
+    local frame = S.hudFrame
+    local maxHealth = math.max(1, UnitHealthMax("player"))
+    local maxMana = math.max(1, UnitManaMax("player"))
+    local health = UnitHealth("player") / maxHealth
+    local mana = UnitMana("player") / maxMana
+    -- Ease toward the real values so a big hit slides instead of jumping.
+    local step = math.min(1, elapsed * 10)
+    HUD.health = HUD.health + (health - HUD.health) * step
+    HUD.mana = HUD.mana + (mana - HUD.mana) * step
+    HUD.SetFill(frame.health, HUD.health)
+    HUD.SetFill(frame.mana, HUD.mana)
+
+    -- The opacity slider makes only the arcs see-through; the numbers stay
+    -- readable. Green at full health, yellow at half, red when low.
+    local opacity = (tonumber(MageCore_Config.HUDAlpha) or 80) / 100
+    if health > 0.5 then
+        frame.health.fill:SetVertexColor(
+            1 - (health - 0.5) * 1.6, 0.9, 0.2 * (health - 0.5) * 2, opacity)
+    else
+        frame.health.fill:SetVertexColor(1, health * 1.8, 0, opacity)
+    end
+    frame.mana.fill:SetVertexColor(0.25, 0.55, 1, opacity)
+    frame.health.back:SetVertexColor(0, 0, 0, 0.5 * opacity)
+    frame.mana.back:SetVertexColor(0, 0, 0, 0.5 * opacity)
+
+    if MageCore_Config.HUDNumbers then
+        frame.health.text:SetText(math.floor(health * 100 + 0.5) .. "%")
+        frame.mana.text:SetText(math.floor(mana * 100 + 0.5) .. "%")
+    else
+        frame.health.text:SetText("")
+        frame.mana.text:SetText("")
+    end
+
+    local wanted = HUD.IsWanted() and 1 or 0
+    if HUD.alpha < wanted then
+        HUD.alpha = math.min(wanted, HUD.alpha + elapsed * 4)
+    elseif HUD.alpha > wanted then
+        HUD.alpha = math.max(wanted, HUD.alpha - elapsed * 2)
+    end
+    frame:SetAlpha(HUD.alpha)
+end
+
+function HUD.Create()
+    if S.hudFrame then return end
+    local frame = CreateFrame("Frame", "MageCoreHUD", UIParent)
+    S.hudFrame = frame
+    frame:SetWidth(HUD.ARC_WIDTH * 2 + HUD.GAP)
+    frame:SetHeight(HUD.ARC_HEIGHT)
+    frame:SetFrameStrata("LOW")
+    BARS.MakeMovable(frame, "HUD", "HUDLocked")
+    frame.health = HUD.MakeArc(frame, "BOTTOMLEFT", false)
+    frame.mana = HUD.MakeArc(frame, "BOTTOMRIGHT", true)
+    -- SetTexture returns nil for a file the client has not indexed yet,
+    -- which happens until WoW is restarted after installing a new image.
+    if not frame.health.back:SetTexture(HUD.TEXTURE) then
+        DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r The HUD image "
+            .. "is not loaded yet. Exit WoW completely and start it again "
+            .. "(a /reload is not enough for new image files).")
+    end
+    frame:SetScript("OnUpdate", HUD.OnUpdate)
+    frame:SetAlpha(0)
+    frame:Hide()
+end
+
+function HUD.ApplyConfig()
+    EnsureConfig()
+    if not MageCore_Config.HUDShown then
+        if S.hudFrame then S.hudFrame:Hide() end
+        return
+    end
+    HUD.Create()
+    BARS.Apply(S.hudFrame, "HUD", -20)
+    S.hudFrame:EnableMouse(not MageCore_Config.HUDLocked)
+    S.hudFrame:Show()
+end
+
+-- Unlock and close the menu so the HUD can be dragged; again to lock.
+function HUD.ToggleMove()
+    EnsureConfig()
+    MageCore_Config.HUDLocked = not MageCore_Config.HUDLocked
+    local message
+    if MageCore_Config.HUDLocked then
+        message = "HUD locked."
+    else
+        if MageCoreMenuFrame then MageCoreMenuFrame:Hide() end
+        message = "HUD unlocked. Drag it into place, then type "
+            .. "|cffffffff/mc hud move|r again to lock it."
+    end
+    HUD.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+function HUD.Command(argument)
+    EnsureConfig()
+    local message
+    if argument == "move" then
+        HUD.ToggleMove()
+        return
+    elseif argument == "" then
+        MageCore_Config.HUDShown = not MageCore_Config.HUDShown
+    elseif argument == "on" then
+        MageCore_Config.HUDShown = true
+    elseif argument == "off" then
+        MageCore_Config.HUDShown = false
+    elseif argument == "reset" then
+        MageCore_Config.HUDX = 0
+        MageCore_Config.HUDY = -20
+        MageCore_Config.HUDScale = 100
+        message = "HUD position and size reset."
+    else
+        message = "Use |cffffffff/mc hud on|r, |cffffffffoff|r, |cffffffffmove|r or |cffffffffreset|r."
+    end
+    HUD.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    message = message or ("HUD " .. (MageCore_Config.HUDShown
+        and "|cff00ff00shown|r" or "|cffff4444hidden|r") .. ".")
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+-- The HUD sets itself up at login so the main event handler stays under
+-- Vanilla Lua's upvalue limit.
+HUD.loader = CreateFrame("Frame")
+HUD.loader:RegisterEvent("PLAYER_LOGIN")
+HUD.loader:RegisterEvent("PLAYER_ENTERING_WORLD")
+HUD.loader:SetScript("OnEvent", HUD.ApplyConfig)
+
+-- ---------------------------------------------------------------------------
 -- Movable XP bar. Purple while rested XP is available, blue otherwise; the
 -- lighter overlay shows how far the rested bonus reaches. Hidden at max level.
 -- ---------------------------------------------------------------------------
@@ -5550,6 +5752,7 @@ local function AfterSettingsChanged()
     XP.ApplyConfig()
     CB.ApplyConfig()
     TGT.ApplyConfig()
+    HUD.ApplyConfig()
 end
 
 local function ProfileCommand(subcommand, name)
@@ -5622,6 +5825,7 @@ local function PrintHelp()
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast test|r  show a fake fight on the target cast bar")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast move|r  unlock the target cast bar to drag it, again to lock")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc burst [on/off]|r  switch Burst Mode (PvP Mode)")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc hud on/off/move/reset|r  health and mana arcs")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc reset|r  restore default settings")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc debug|r, |cffffffff/mc ampdebug|r, |cffffffff/mc amptest|r, |cffffffff/mc platedebug|r")
 end
@@ -5644,6 +5848,8 @@ local function SlashCommand(message)
         TGT.Command((string.gsub(command, "^tcast%s*", "")))
     elseif command == "xp" or string.find(command, "^xp%s") then
         XP.Command((string.gsub(command, "^xp%s*", "")))
+    elseif command == "hud" or string.find(command, "^hud%s") then
+        HUD.Command((string.gsub(command, "^hud%s*", "")))
     elseif command == "burst" or command == "burst on" or command == "burst off" then
         -- Quick switch for a macro: /mc burst toggles, on/off set it.
         EnsureConfig()
@@ -6237,6 +6443,55 @@ function UI.BuildBarsPanel(panel)
         "|cffffffff/mc xp|r, |cffffffff/mc cast|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset")
 end
 
+function UI.BuildHUDPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "HUD|r")
+    UI.AddHelpText(panel, 18, -40, "Health arc on the left and mana arc on the right of your character. It fades out while you are idle at full health and mana.")
+
+    UI.MakeToggleButton(panel, 180, 18, -75, "HUD", "HUDShown", "HUD",
+        "Shows the health and mana arcs around the middle of the screen. Health turns from green to yellow to red as it drops; mana is blue.",
+        HUD.ApplyConfig)
+
+    local moveButton = CreateFrame("Button", nil, panel)
+    moveButton:SetWidth(180)
+    moveButton:SetHeight(32)
+    moveButton:SetPoint("TOPLEFT", 210, -75)
+    StyleButton(moveButton)
+    local moveText = moveButton:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    moveText:SetPoint("CENTER", 0, 0)
+    local function RefreshMove()
+        moveText:SetText(MageCore_Config.HUDLocked and "Move HUD" or "Lock HUD")
+    end
+    RefreshMove()
+    table.insert(S.menuRefreshers, RefreshMove)
+    moveButton:SetScript("OnClick", HUD.ToggleMove)
+    UI.AddSimpleTooltip(moveButton, "Move HUD",
+        "Closes this window and unlocks the HUD so you can drag it. Type |cffffffff/mc hud move|r or press Lock HUD here to lock it again.")
+
+    UI.MakeToggleButton(panel, 180, 18, -120, "Always show", "HUDAlwaysShow",
+        "Always show",
+        "Keeps the HUD visible all the time. When off, it shows in combat, with an enemy targeted, or while your health or mana is not full.")
+    UI.MakeToggleButton(panel, 180, 210, -120, "Numbers", "HUDNumbers",
+        "Numbers", "Shows health and mana percentages under the arcs.")
+
+    UI.MakeSlider(panel, "MageCoreHUDScaleSlider", 28, -180, 50, 200, 5,
+        "HUDScale", 100, "50%", "200%",
+        function(value)
+            if S.hudFrame then BARS.Apply(S.hudFrame, "HUD", -20) end
+            return "HUD size: " .. value .. "%"
+        end)
+    UI.MakeSlider(panel, "MageCoreHUDAlphaSlider", 28, -230, 5, 100, 5,
+        "HUDAlpha", 80, "5%", "100%",
+        function(value) return "Arc opacity: " .. value .. "%" end)
+
+    UI.AddHelpText(panel, 18, -275,
+        "|cffffffff/mc hud on/off|r  show or hide the HUD\n"
+        .. "|cffffffff/mc hud move|r  unlock to drag, again to lock\n"
+        .. "|cffffffff/mc hud reset|r  back to the middle at 100% size")
+end
+
 function UI.BuildExtraPanel(panel)
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -8)
@@ -6287,7 +6542,7 @@ function MageCore_CreateMenu()
     RefreshSpellBook()
 
     local frame = CreateFrame("Frame", "MageCoreMenuFrame", UIParent)
-    frame:SetWidth(520)
+    frame:SetWidth(584)
     frame:SetHeight(500)
     frame:SetPoint("CENTER", 0, 0)
     frame:SetFrameStrata("HIGH")
@@ -6320,6 +6575,7 @@ function MageCore_CreateMenu()
         { "PvP", UI.BuildPvPPanel },
         { "Info", UI.BuildInfoPanel },
         { "Bars", UI.BuildBarsPanel },
+        { "HUD", UI.BuildHUDPanel },
         { "Extra", UI.BuildExtraPanel }
     }
     local panels = {}
