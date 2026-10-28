@@ -6,7 +6,7 @@ if playerClass ~= "MAGE" then return end
 
 -- Kept in the code as well as in MageCore.toc: the client reads the .toc
 -- only when the game starts, so a /reload would show an old version.
-local VERSION = "1.13.0"
+local VERSION = "1.14.0"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
@@ -2051,6 +2051,11 @@ local function LoadDefaults()
     if MageCore_Config.HUDAlwaysShow == nil then MageCore_Config.HUDAlwaysShow = false end
     if MageCore_Config.HUDNumbers == nil then MageCore_Config.HUDNumbers = true end
     if MageCore_Config.HUDCastBar == nil then MageCore_Config.HUDCastBar = true end
+    -- One lock for every movable frame; the per-frame keys follow it.
+    if MageCore_Config.FramesLocked == nil then MageCore_Config.FramesLocked = true end
+    MageCore_Config.XPBarLocked = MageCore_Config.FramesLocked
+    MageCore_Config.TargetCastBarLocked = MageCore_Config.FramesLocked
+    MageCore_Config.HUDLocked = MageCore_Config.FramesLocked
     if MageCore_Config.EnemyCooldowns == nil then
         MageCore_Config.EnemyCooldowns = true
     end
@@ -4454,29 +4459,15 @@ function TGT.ApplyConfig()
     TGT.OnUpdate()
 end
 
--- Unlock and close the menu, which otherwise covers the bar in the middle of
--- the screen; a second call locks it again.
-function TGT.ToggleMove()
-    EnsureConfig()
-    MageCore_Config.TargetCastBarLocked = not MageCore_Config.TargetCastBarLocked
-    local message
-    if MageCore_Config.TargetCastBarLocked then
-        message = "Target cast bar locked."
-    else
-        if MageCoreMenuFrame then MageCoreMenuFrame:Hide() end
-        message = "Target cast bar unlocked. Drag it into place, then type "
-            .. "|cffffffff/mc tcast move|r again to lock it."
-    end
-    TGT.ApplyConfig()
-    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
-    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
-end
-
 function TGT.Command(argument)
     EnsureConfig()
     local message
+    -- Moving uses the one shared lock for all MageCore frames.
     if argument == "move" then
-        TGT.ToggleMove()
+        UI.ToggleFramesLocked()
+        return
+    elseif argument == "lock" or argument == "unlock" then
+        UI.SetFramesLocked(argument == "lock")
         return
     elseif argument == "test" then
         TGT.Create()
@@ -4510,19 +4501,13 @@ function TGT.Command(argument)
         MageCore_Config.TargetCastBarShown = true
     elseif argument == "off" then
         MageCore_Config.TargetCastBarShown = false
-    elseif argument == "lock" then
-        MageCore_Config.TargetCastBarLocked = true
-        message = "Target cast bar locked."
-    elseif argument == "unlock" then
-        MageCore_Config.TargetCastBarLocked = false
-        message = "Target cast bar unlocked. Drag it to move it."
     elseif argument == "reset" then
         MageCore_Config.TargetCastBarX = 0
         MageCore_Config.TargetCastBarY = -100
         MageCore_Config.TargetCastBarScale = 100
         message = "Target cast bar position and size reset."
     else
-        message = "Use |cffffffff/mc tcast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r, |cffffffffreset|r, |cfffffffftest|r or |cffffffffdebug|r."
+        message = "Use |cffffffff/mc tcast on|r, |cffffffffoff|r, |cffffffffreset|r, |cfffffffftest|r or |cffffffffdebug|r. Move it with |cffffffff/mc unlock|r."
     end
     TGT.ApplyConfig()
     if UI.RefreshMenuControls then UI.RefreshMenuControls() end
@@ -4631,7 +4616,7 @@ function HUD.UpdateCastBar(opacity)
         -- Preview while the HUD is unlocked for moving.
         bar:SetMinMaxValues(0, 1)
         bar:SetValue(0.6)
-        bar.text:SetText("Preview - /mc hud move to lock")
+        bar.text:SetText("Preview - /mc lock to lock")
     else
         local duration = math.max(0.1, cast.endTime - cast.startTime)
         bar:SetMinMaxValues(0, duration)
@@ -4805,28 +4790,15 @@ function HUD.ApplyConfig()
     S.hudFrame:Show()
 end
 
--- Unlock and close the menu so the HUD can be dragged; again to lock.
-function HUD.ToggleMove()
-    EnsureConfig()
-    MageCore_Config.HUDLocked = not MageCore_Config.HUDLocked
-    local message
-    if MageCore_Config.HUDLocked then
-        message = "HUD locked."
-    else
-        if MageCoreMenuFrame then MageCoreMenuFrame:Hide() end
-        message = "HUD unlocked. Drag it into place, then type "
-            .. "|cffffffff/mc hud move|r again to lock it."
-    end
-    HUD.ApplyConfig()
-    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
-    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
-end
-
 function HUD.Command(argument)
     EnsureConfig()
     local message
+    -- Moving uses the one shared lock for all MageCore frames.
     if argument == "move" then
-        HUD.ToggleMove()
+        UI.ToggleFramesLocked()
+        return
+    elseif argument == "lock" or argument == "unlock" then
+        UI.SetFramesLocked(argument == "lock")
         return
     elseif argument == "" then
         MageCore_Config.HUDShown = not MageCore_Config.HUDShown
@@ -4840,7 +4812,7 @@ function HUD.Command(argument)
         MageCore_Config.HUDScale = 100
         message = "HUD position and size reset."
     else
-        message = "Use |cffffffff/mc hud on|r, |cffffffffoff|r, |cffffffffmove|r or |cffffffffreset|r."
+        message = "Use |cffffffff/mc hud on|r, |cffffffffoff|r or |cffffffffreset|r. Move it with |cffffffff/mc unlock|r."
     end
     HUD.ApplyConfig()
     if UI.RefreshMenuControls then UI.RefreshMenuControls() end
@@ -4959,7 +4931,7 @@ function XP.Create()
         GameTooltip:AddLine("To level: " .. math.max(0, maximum - current), 1, 1, 1)
         GameTooltip:AddLine("Rested: " .. rested, 0.5, 0.5, 1)
         GameTooltip:AddLine(MageCore_Config.XPBarLocked
-            and "Locked (/mc xp unlock)" or "Drag to move (/mc xp lock)",
+            and "Locked (/mc unlock)" or "Drag to move (/mc lock)",
             0.8, 0.8, 0.8)
         GameTooltip:Show()
     end)
@@ -5008,19 +4980,21 @@ function XP.Command(argument)
         MageCore_Config.XPBarShown = true
     elseif argument == "off" then
         MageCore_Config.XPBarShown = false
-    elseif argument == "lock" then
-        MageCore_Config.XPBarLocked = true
-        message = "XP bar locked."
-    elseif argument == "unlock" then
-        MageCore_Config.XPBarLocked = false
-        message = "XP bar unlocked. Drag it to move it."
+    elseif argument == "lock" or argument == "unlock" or argument == "move" then
+        -- Moving uses the one shared lock for all MageCore frames.
+        if argument == "move" then
+            UI.ToggleFramesLocked()
+        else
+            UI.SetFramesLocked(argument == "lock")
+        end
+        return
     elseif argument == "reset" then
         MageCore_Config.XPBarX = 0
         MageCore_Config.XPBarY = -200
         MageCore_Config.XPBarScale = 100
         message = "XP bar position and size reset."
     else
-        message = "Use |cffffffff/mc xp on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
+        message = "Use |cffffffff/mc xp on|r, |cffffffffoff|r or |cffffffffreset|r. Move it with |cffffffff/mc unlock|r."
     end
     XP.ApplyConfig()
     if UI.RefreshMenuControls then UI.RefreshMenuControls() end
@@ -5032,6 +5006,36 @@ function XP.Command(argument)
         end
     end
     DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+-- ---------------------------------------------------------------------------
+-- One lock for every movable MageCore frame: the XP bar, the target cast bar
+-- with its alert and cooldown icons, and the HUD. Unlocking closes the menu,
+-- which would otherwise cover the frames in the middle of the screen.
+-- ---------------------------------------------------------------------------
+function UI.SetFramesLocked(locked)
+    EnsureConfig()
+    MageCore_Config.FramesLocked = locked and true or false
+    MageCore_Config.XPBarLocked = MageCore_Config.FramesLocked
+    MageCore_Config.TargetCastBarLocked = MageCore_Config.FramesLocked
+    MageCore_Config.HUDLocked = MageCore_Config.FramesLocked
+    XP.ApplyConfig()
+    TGT.ApplyConfig()
+    HUD.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    if locked then
+        DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r All frames locked.")
+    else
+        if MageCoreMenuFrame then MageCoreMenuFrame:Hide() end
+        DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r All frames "
+            .. "unlocked. Drag the XP bar, target cast bar and HUD into place, "
+            .. "then type |cffffffff/mc lock|r to lock them all.")
+    end
+end
+
+function UI.ToggleFramesLocked()
+    EnsureConfig()
+    UI.SetFramesLocked(not MageCore_Config.FramesLocked)
 end
 
 
@@ -5722,12 +5726,11 @@ local function PrintHelp()
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc|r  open or close the window")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc box on/off|r  rotation monitor")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc profile save/load/delete <name>|r, |cffffffff/mc profile list|r")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc xp on/off/lock/unlock/reset|r  movable XP bar")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast on/off/lock/unlock/reset|r  target cast bar and no-slow alert")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc unlock|r, |cffffffff/mc lock|r  move all MageCore frames, then lock them")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast on/off/reset|r  target cast bar and no-slow alert")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast test|r  show a fake fight on the target cast bar")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc tcast move|r  unlock the target cast bar to drag it, again to lock")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc burst [on/off]|r  switch Burst Mode (PvP Mode)")
-    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc hud on/off/move/reset|r  health and mana arcs")
+   DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc burst [on/off]|r  switch Burst Mode (PvP Mode)")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc hud on/off/reset|r  health and mana arcs")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc reset|r  restore default settings")
     DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc debug|r, |cffffffff/mc ampdebug|r, |cffffffff/mc amptest|r, |cffffffff/mc platedebug|r")
 end
@@ -5748,6 +5751,10 @@ local function SlashCommand(message)
         TGT.Command((string.gsub(command, "^tcast%s*", "")))
     elseif command == "xp" or string.find(command, "^xp%s") then
         XP.Command((string.gsub(command, "^xp%s*", "")))
+    elseif command == "lock" or command == "unlock" then
+        UI.SetFramesLocked(command == "lock")
+    elseif command == "move" then
+        UI.ToggleFramesLocked()
     elseif command == "hud" or string.find(command, "^hud%s") then
         HUD.Command((string.gsub(command, "^hud%s*", "")))
     elseif command == "burst" or command == "burst on" or command == "burst off" then
@@ -6269,14 +6276,12 @@ function UI.BuildBarsPanel(panel)
     local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -8)
     title:SetText(ACCENT .. "Bars|r")
-    UI.AddHelpText(panel, 18, -40, "Drag a bar to move it while it is unlocked, then lock it once it sits where you want it.")
+    UI.AddHelpText(panel, 18, -40, "Press Unlock frames at the top of this window to drag the bars, then lock them all at once.")
 
     UI.MakeToggleButton(panel, 150, 18, -75, "XP Bar", "XPBarShown",
         "XP Bar",
         "Shows a movable experience bar with rested XP. It is hidden automatically at max level.",
         XP.ApplyConfig)
-    UI.MakeCheckBox(panel, "MageCoreXPBarLockCheck", 185, -79,
-        "Lock XP bar", "XPBarLocked")
     UI.MakeSlider(panel, "MageCoreXPBarScaleSlider", 28, -130, 50, 200, 5,
         "XPBarScale", 100, "50%", "200%",
         function(value)
@@ -6288,11 +6293,6 @@ function UI.BuildBarsPanel(panel)
         "Target Cast Bar",
         "Shows a large movable bar with what your current target is casting: spell icon, name and remaining time. Gold while casting, green while channeling, red when interrupted. The PvP tab's No-slow alert sits just above it and moves with it.",
         TGT.ApplyConfig)
-    UI.MakeCheckBox(panel, "MageCoreTargetCastBarLockCheck", 185, -184,
-        "Lock target cast bar", "TargetCastBarLocked",
-        TGT.ApplyConfig,
-        "Lock target cast bar",
-        "While unlocked, the target cast bar and the no-slow alert show a preview so you can drag them into place.")
     UI.MakeSlider(panel, "MageCoreTargetCastBarScaleSlider", 28, -235, 50, 200, 5,
         "TargetCastBarScale", 100, "50%", "200%",
         function(value)
@@ -6302,25 +6302,8 @@ function UI.BuildBarsPanel(panel)
             return "Target cast bar size: " .. value .. "%"
         end)
 
-    local moveButton = CreateFrame("Button", nil, panel)
-    moveButton:SetWidth(90)
-    moveButton:SetHeight(26)
-    moveButton:SetPoint("TOPLEFT", 295, -227)
-    StyleButton(moveButton)
-    local moveText = moveButton:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    moveText:SetPoint("CENTER", 0, 0)
-    local function RefreshMove()
-        moveText:SetText(MageCore_Config.TargetCastBarLocked and "Move" or "Lock")
-    end
-    RefreshMove()
-    table.insert(S.menuRefreshers, RefreshMove)
-    moveButton:SetScript("OnClick", TGT.ToggleMove)
-    UI.AddSimpleTooltip(moveButton, "Move target cast bar",
-        "Closes this window and unlocks the target cast bar, the no-slow alert and the cooldown icons so you can drag them. Type |cffffffff/mc tcast move|r or press Lock here to lock them again.")
-
     UI.AddHelpText(panel, 18, -280,
-        "|cffffffff/mc xp|r, |cffffffff/mc tcast|r: on/off/lock/unlock/reset\nYour own cast bar is part of the HUD (HUD tab).")
+        "|cffffffff/mc xp|r, |cffffffff/mc tcast|r: on/off/reset\nMove the bars with |cffffffffUnlock frames|r at the top of this window or |cffffffff/mc unlock|r. Your own cast bar is part of the HUD (HUD tab).")
 end
 
 function UI.BuildHUDPanel(panel)
@@ -6332,23 +6315,6 @@ function UI.BuildHUDPanel(panel)
     UI.MakeToggleButton(panel, 180, 18, -75, "HUD", "HUDShown", "HUD",
         "Shows the health and mana arcs around the middle of the screen. Health turns from green to yellow to red as it drops; mana is blue.",
         HUD.ApplyConfig)
-
-    local moveButton = CreateFrame("Button", nil, panel)
-    moveButton:SetWidth(180)
-    moveButton:SetHeight(32)
-    moveButton:SetPoint("TOPLEFT", 210, -75)
-    StyleButton(moveButton)
-    local moveText = moveButton:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    moveText:SetPoint("CENTER", 0, 0)
-    local function RefreshMove()
-        moveText:SetText(MageCore_Config.HUDLocked and "Move HUD" or "Lock HUD")
-    end
-    RefreshMove()
-    table.insert(S.menuRefreshers, RefreshMove)
-    moveButton:SetScript("OnClick", HUD.ToggleMove)
-    UI.AddSimpleTooltip(moveButton, "Move HUD",
-        "Closes this window and unlocks the HUD so you can drag it. Type |cffffffff/mc hud move|r or press Lock HUD here to lock it again.")
 
     UI.MakeToggleButton(panel, 180, 18, -120, "Always show", "HUDAlwaysShow",
         "Always show",
@@ -6372,7 +6338,7 @@ function UI.BuildHUDPanel(panel)
 
     UI.AddHelpText(panel, 18, -320,
         "|cffffffff/mc hud on/off|r  show or hide the HUD\n"
-        .. "|cffffffff/mc hud move|r  unlock to drag, again to lock\n"
+        .. "|cffffffffUnlock frames|r (top of this window) or |cffffffff/mc unlock|r  drag it\n"
         .. "|cffffffff/mc hud reset|r  back to the middle at 100% size")
 end
 
@@ -6450,6 +6416,25 @@ function MageCore_CreateMenu()
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -5, -5)
     close:SetScript("OnClick", function() frame:Hide() end)
+
+    -- One lock for every movable frame, on every tab.
+    local lockButton = CreateFrame("Button", nil, frame)
+    lockButton:SetWidth(110)
+    lockButton:SetHeight(24)
+    lockButton:SetPoint("TOPLEFT", 16, -16)
+    StyleButton(lockButton)
+    local lockText = lockButton:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    lockText:SetPoint("CENTER", 0, 0)
+    local function RefreshLock()
+        lockText:SetText(MageCore_Config.FramesLocked
+            and "Unlock frames" or "|cffff8040Lock frames|r")
+    end
+    RefreshLock()
+    table.insert(S.menuRefreshers, RefreshLock)
+    lockButton:SetScript("OnClick", UI.ToggleFramesLocked)
+    UI.AddSimpleTooltip(lockButton, "Unlock / lock frames",
+        "Unlocks the XP bar, the target cast bar with its alert and cooldown icons, and the HUD so you can drag them. This window closes so it does not cover them. Type |cffffffff/mc lock|r (or open this window and press Lock frames) to lock everything at once.")
 
     local tabs = {
         { "Rotation", UI.BuildRotationPanel },

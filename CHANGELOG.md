@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.14.0
+- **One lock for all frames**: a new **Unlock frames / Lock frames** button at the top of the MageCore window (on every tab), plus `/mc unlock`, `/mc lock` and `/mc move` (toggle), unlocks or locks the XP bar, the target cast bar with its alert and cooldown icons, and the HUD together. Unlocking closes the window so it does not cover them.
+- The separate lock checkboxes and Move buttons on the Bars and HUD tabs are gone. The old `lock`, `unlock` and `move` subcommands of `/mc xp`, `/mc tcast` and `/mc hud` now use the shared lock.
+- All frames start locked after this update.
+
 ## 1.13.0
 - New **HUD cast bar** (HUD tab, on by default): a thin straight yellow bar under your character, between the health and mana arcs, with the spell you are casting and the time left. It follows pushback and channels, flashes green when a cast finishes and red when it is interrupted or fails, and uses the same arc opacity and outlined font as the rest of the HUD. The default cast bar is hidden while it is on. Switch it off with the **Cast bar** toggle.
 - Removed the separate movable player cast bar from the Bars tab and the `/mc cast` command; the HUD cast bar replaces it. The target cast bar is unchanged.
