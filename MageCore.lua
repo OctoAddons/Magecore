@@ -1,40 +1,53 @@
--- MageCore v1.5.97
+-- MageCore
 -- Press-driven mage rotation and self-buff helper for Turtle WoW / Vanilla 1.12.
 
 local _, playerClass = UnitClass("player")
 if playerClass ~= "MAGE" then return end
 
-local VERSION = "1.5.97"
+-- The version lives only in MageCore.toc.
+local VERSION = GetAddOnMetadata
+    and GetAddOnMetadata("MageCore", "Version") or "?"
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Frost_FrostBolt02"
 local ACCENT = "|cff69ccf0"
 
-local spellBookSpells = { "None" }
-local helpfulSpellBookSpells = { "None" }
-local armorSpellBookSpells = { "None" }
-local regularBuffSpellBookSpells = { "None" }
-local knownWaterSpells = {}
-local knownFoodSpells = {}
-local pendingConjure
-local pendingManaAgate
-local conjureRestockActive = {}
-local lastManaAgateBagWarning = -10
-local lastManaAgateSpellWarning = -10
-local lowManaWandFallbackUntil = 0
-local lastCombatSpellAttempt
-local rangeBlockedSpells = {}
-local openerUsedForTarget
-local pvpFrostboltUsedForTarget
-local fireThreatTargets = {}
-local lastGroupBuffAttempt
-local groupBlockedUnits = {}
-local normalCastInProgress = false
-local channelInProgress = false
-local channelSpellName
-local arcaneSurgeAvailableUntil = 0
-local pendingLunaInterruptMessage
-local iceBlockGuardStartedAt
-local spellManaCostCache = {}
+-- All mutable runtime state lives in one table. Vanilla Lua (5.0) allows
+-- at most 200 locals in the main chunk and 32 upvalues per function; one
+-- table keeps both limits far away as the addon grows.
+local S = {
+    spellBookSpells = { "None" },
+    helpfulSpellBookSpells = { "None" },
+    armorSpellBookSpells = { "None" },
+    regularBuffSpellBookSpells = { "None" },
+    knownWaterSpells = {},
+    knownFoodSpells = {},
+    conjureRestockActive = {},
+    lastManaGemBagWarning = -10,
+    lastManaGemSpellWarning = -10,
+    lowManaWandFallbackUntil = 0,
+    rangeBlockedSpells = {},
+    fireThreatTargets = {},
+    groupBlockedUnits = {},
+    normalCastInProgress = false,
+    channelInProgress = false,
+    arcaneSurgeAvailableUntil = 0,
+    spellManaCostCache = {},
+    rotationBoxRows = {},
+    updateElapsed = 0,
+    frostNovaRangeElapsed = 0,
+    frostNovaRangeDistanceIndex = 3,
+    frostNovaRangeYards = 10,
+    arcticReachRank = 0,
+    frostNovaNameplateCount = 0,
+    frostNovaNameplates = {},
+    autoRepeatActive = false,
+    auraCache = {},
+    guidDispositions = {},
+    guidDispositionCount = 0,
+    menuRefreshers = {},
+    buffElapsed = 0,
+}
+
 
 -- Vanilla 1.12 has no IsHelpfulSpell/IsHarmfulSpell API. These category
 -- hints are applied only to spells actually found in the player's spellbook.
@@ -101,12 +114,6 @@ local ARCANE_SURGE_TRIGGER_SPELLS = {
     "Blizzard", "Arcane Explosion"
 }
 
-local FROST_SLOW_NAMES = {
-    ["frostbolt"] = true, ["cone of cold"] = true, ["blizzard"] = true,
-    ["frost armor"] = true, ["ice armor"] = true, ["frostbite"] = true,
-    ["freeze"] = true, ["chilled"] = true
-}
-
 local HEALING_SPELL_NAMES = {
     ["healing touch"] = true, ["regrowth"] = true, ["tranquility"] = true,
     ["rejuvenation"] = true, ["renew"] = true, ["restoration"] = true,
@@ -139,24 +146,8 @@ local ATTACK_TEXT_HINTS = {
     "freezes", "slows", "silences"
 }
 
-local rotationIconTexture
-local arcaneExplosionIconTexture
-local buffIconTexture
-local foodStatusText
-local rotationBoxFrame
-local rotationBoxRows = {}
-local updateElapsed = 0
-local frostNovaRangeElapsed = 0
-local frostNovaRangeDistanceIndex = 3
-local frostNovaRangeYards = 10
-local arcticReachRank = 0
-local frostNovaNameplateCount = 0
-local frostNovaNameplates = {}
 local NAMEPLATE_VERTICAL_OFFSET = 24
-local autoRepeatActive = false
-local lastRotationIcon
-local lastArcaneExplosionIcon
-local lastBuffIcon
+local NON_TARGET_NAME_FONT_SCALE = 2
 
 local function TextureName(texture)
     if not texture then return nil end
@@ -187,8 +178,7 @@ local function TooltipHasAny(spellIndex, hints)
     return false
 end
 
-local function GetSpellBookIndex(spellName)
-    if not spellName or spellName == "None" then return nil end
+local function ScanSpellBookIndex(spellName)
     local _, _, baseName, wantedRank = string.find(spellName, "^(.+)%((.+)%)$")
     baseName = baseName or spellName
     local i
@@ -204,8 +194,24 @@ local function GetSpellBookIndex(spellName)
     return highestIndex
 end
 
+-- Spellbook positions only change when spells are learned, so lookups are
+-- cached until the next SPELLS_CHANGED/LEARNED_SPELL_IN_TAB refresh. Misses
+-- are cached as false so unlearned spells do not trigger repeated scans.
+local function GetSpellBookIndex(spellName)
+    if not spellName or spellName == "None" then return nil end
+    local cache = S.spellIndexCache
+    if not cache then return ScanSpellBookIndex(spellName) end
+    local cached = cache[spellName]
+    if cached == nil then
+        cached = ScanSpellBookIndex(spellName) or false
+        cache[spellName] = cached
+    end
+    return cached or nil
+end
+
 local function RefreshSpellBook()
-    spellManaCostCache = {}
+    S.spellManaCostCache = {}
+    S.spellIndexCache = {}
     local learned = {}
     local helpful = {}
     local seen = {}
@@ -299,8 +305,8 @@ local function RefreshSpellBook()
     end
     table.sort(waterRanks, HighestRankFirst)
     table.sort(foodRanks, HighestRankFirst)
-    knownWaterSpells = waterRanks
-    knownFoodSpells = foodRanks
+    S.knownWaterSpells = waterRanks
+    S.knownFoodSpells = foodRanks
 
     -- Existing conjure selections migrate to automatic highest-rank mode.
     -- Choosing an exact rank from the menu disables this behavior.
@@ -315,7 +321,7 @@ local function RefreshSpellBook()
                 and MageCore_Config[kind .. "Spell"] ~= highest.cast then
                 MageCore_Config[kind .. "Spell"] = highest.cast
                 MageCore_Config[kind .. "ItemID"] = nil
-                if pendingConjure and pendingConjure.kind == kind then pendingConjure = nil end
+                if S.pendingConjure and S.pendingConjure.kind == kind then S.pendingConjure = nil end
             end
             local dropdown = getglobal("MC_ConjureDrop_" .. kind)
             if dropdown and MageCore_Config[kind .. "AutoRank"] and highest then
@@ -328,20 +334,20 @@ local function RefreshSpellBook()
 
     table.sort(learned)
     table.sort(helpful)
-    spellBookSpells = { "None" }
-    helpfulSpellBookSpells = { "None" }
-    armorSpellBookSpells = { "None" }
-    regularBuffSpellBookSpells = { "None" }
+    S.spellBookSpells = { "None" }
+    S.helpfulSpellBookSpells = { "None" }
+    S.armorSpellBookSpells = { "None" }
+    S.regularBuffSpellBookSpells = { "None" }
     for i = 1, table.getn(learned) do
-        table.insert(spellBookSpells, learned[i])
+        table.insert(S.spellBookSpells, learned[i])
     end
     for i = 1, table.getn(helpful) do
         local spellName = helpful[i]
-        table.insert(helpfulSpellBookSpells, spellName)
+        table.insert(S.helpfulSpellBookSpells, spellName)
         if MAGE_ARMOR_NAMES[spellName] then
-            table.insert(armorSpellBookSpells, spellName)
+            table.insert(S.armorSpellBookSpells, spellName)
         else
-            table.insert(regularBuffSpellBookSpells, spellName)
+            table.insert(S.regularBuffSpellBookSpells, spellName)
         end
     end
 
@@ -375,13 +381,13 @@ local function RefreshSpellBook()
     if arcticReachIndex then
         local _, rankText = GetSpellName(arcticReachIndex, BOOKTYPE_SPELL)
         local _, _, rankNumber = string.find(rankText or "", "(%d+)")
-        arcticReachRank = math.max(1, math.min(2, tonumber(rankNumber) or 1))
-        frostNovaRangeDistanceIndex = 2
-        frostNovaRangeYards = 10 + arcticReachRank
+        S.arcticReachRank = math.max(1, math.min(2, tonumber(rankNumber) or 1))
+        S.frostNovaRangeDistanceIndex = 2
+        S.frostNovaRangeYards = 10 + S.arcticReachRank
     else
-        arcticReachRank = 0
-        frostNovaRangeDistanceIndex = 3
-        frostNovaRangeYards = 10
+        S.arcticReachRank = 0
+        S.frostNovaRangeDistanceIndex = 3
+        S.frostNovaRangeYards = 10
     end
 end
 
@@ -393,8 +399,8 @@ end
 
 local function GetSpellManaCost(spellName)
     if not spellName or spellName == "None" then return nil end
-    if spellManaCostCache[spellName] ~= nil then
-        return spellManaCostCache[spellName] or nil
+    if S.spellManaCostCache[spellName] ~= nil then
+        return S.spellManaCostCache[spellName] or nil
     end
     local index = GetSpellBookIndex(spellName)
     if not index then return nil end
@@ -411,13 +417,13 @@ local function GetSpellManaCost(spellName)
                 local clean = string.gsub(value, ",", "")
                 local _, _, cost = string.find(clean, "(%d+)%s+[Mm]ana")
                 if cost then
-                    spellManaCostCache[spellName] = tonumber(cost)
+                    S.spellManaCostCache[spellName] = tonumber(cost)
                     return tonumber(cost)
                 end
             end
         end
     end
-    spellManaCostCache[spellName] = false
+    S.spellManaCostCache[spellName] = false
     return nil
 end
 
@@ -445,9 +451,16 @@ local function GetSpellCooldownRemaining(spellName)
     return math.max(0, start + duration - GetTime())
 end
 
-local function UnitHasBuff(unit, spellName)
-    local wanted = NormalizeTexture(GetSpellTextureByName(spellName))
-    if not wanted then return false end
+-- Aura lists are cached briefly per unit token. UNIT_AURA, target and roster
+-- events invalidate them, so the cache mainly prevents the 0.4s display
+-- update from tooltip-scanning a whole raid every tick.
+local AURA_CACHE_SECONDS = 1.5
+
+local function GetUnitAuras(unit)
+    local now = GetTime()
+    local cached = S.auraCache[unit]
+    if cached and now - cached.time < AURA_CACHE_SECONDS then return cached end
+    cached = { time = now }
     local i
     for i = 1, 32 do
         local texture = UnitBuff(unit, i)
@@ -463,9 +476,28 @@ local function UnitHasBuff(unit, spellName)
                 auraName = nameLine and nameLine:GetText()
             end
         end
-        if auraName then
-            if auraName == spellName then return true end
-        elseif NormalizeTexture(texture) == wanted then
+        table.insert(cached, {
+            name = auraName, texture = NormalizeTexture(texture)
+        })
+    end
+    S.auraCache[unit] = cached
+    return cached
+end
+
+local function InvalidateAuraCache(unit)
+    if unit then S.auraCache[unit] = nil else S.auraCache = {} end
+end
+
+local function UnitHasBuff(unit, spellName)
+    local wanted = NormalizeTexture(GetSpellTextureByName(spellName))
+    if not wanted then return false end
+    local auras = GetUnitAuras(unit)
+    local i
+    for i = 1, table.getn(auras) do
+        local aura = auras[i]
+        if aura.name then
+            if aura.name == spellName then return true end
+        elseif aura.texture == wanted then
             -- Stock-compatible fallback for clients that cannot expose aura
             -- names. Name matching above avoids false positives from shared
             -- icons such as Amplify Magic's Flash Heal artwork.
@@ -479,48 +511,64 @@ local function PlayerHasBuff(spellName)
     return UnitHasBuff("player", spellName)
 end
 
-local function TargetHasFrostSlow()
-    if not UnitExists("target") then return false end
+local function GetTargetPvpFrostEffect()
+    if not UnitExists("target") then return nil end
 
-    local slowTextures = {}
-    local slowSpells = { "Frostbolt", "Cone of Cold", "Blizzard", "Frost Armor", "Ice Armor" }
-    local _, spellName
-    for _, spellName in ipairs(slowSpells) do
-        local texture = NormalizeTexture(GetSpellTextureByName(spellName))
-        if texture then slowTextures[texture] = true end
+    local wantedNames = {
+        ["frostbolt"] = "CHILLED",
+        ["cone of cold"] = "CHILLED",
+        ["frost nova"] = "FROZEN",
+        ["frostbite"] = "FROZEN",
+        ["freeze"] = "FROZEN"
+    }
+    local wantedTextures = {
+        CHILLED = {},
+        FROZEN = {}
+    }
+    local frostSpells = {
+        { "Frostbolt", "CHILLED" },
+        { "Cone of Cold", "CHILLED" },
+        { "Frost Nova", "FROZEN" },
+        { "Frostbite", "FROZEN" },
+        { "Freeze", "FROZEN" }
+    }
+    local _, spellInfo
+    for _, spellInfo in ipairs(frostSpells) do
+        local texture = NormalizeTexture(GetSpellTextureByName(spellInfo[1]))
+        if texture then wantedTextures[spellInfo[2]][texture] = true end
     end
 
+    local foundChill = false
     local i
     for i = 1, 16 do
         local texture = UnitDebuff("target", i)
         if not texture then break end
         local normalizedTexture = NormalizeTexture(texture)
-        if slowTextures[normalizedTexture] then return true end
-
+        local debuffName
         if spellScanTooltip.SetUnitDebuff then
             spellScanTooltip:ClearLines()
-            spellScanTooltip:SetUnitDebuff("target", i)
-            local nameLine = getglobal("MageCoreSpellScanTooltipTextLeft1")
-            local debuffName = nameLine and nameLine:GetText()
-            if debuffName and FROST_SLOW_NAMES[string.lower(debuffName)] then return true end
-
-            -- Catch custom Turtle frost slows whose names are not in the known
-            -- list, while avoiding non-frost movement impairing effects.
-            if normalizedTexture and string.find(normalizedTexture, "spell_frost", 1, true) then
-                local line
-                for line = 2, 10 do
-                    local textLine = getglobal("MageCoreSpellScanTooltipTextLeft" .. line)
-                    local text = textLine and textLine:GetText()
-                    text = text and string.lower(text)
-                    if text and (string.find(text, "movement speed", 1, true)
-                        or string.find(text, "slowed", 1, true)) then
-                        return true
-                    end
-                end
+            local ok = pcall(
+                spellScanTooltip.SetUnitDebuff,
+                spellScanTooltip, "target", i)
+            if ok then
+                local nameLine = getglobal(
+                    "MageCoreSpellScanTooltipTextLeft1")
+                debuffName = nameLine and nameLine:GetText()
             end
         end
+        if debuffName then
+            local effect = wantedNames[string.lower(debuffName)]
+            if effect == "FROZEN" then return effect end
+            if effect == "CHILLED" then foundChill = true end
+        elseif wantedTextures.FROZEN[normalizedTexture] then
+            -- Stock-compatible fallback for clients that cannot expose aura
+            -- names. All ranks of each spell share its debuff texture.
+            return "FROZEN"
+        elseif wantedTextures.CHILLED[normalizedTexture] then
+            foundChill = true
+        end
     end
-    return false
+    return foundChill and "CHILLED" or nil
 end
 
 local function HasLivingEnemyTarget()
@@ -529,10 +577,34 @@ local function HasLivingEnemyTarget()
         and not UnitIsDeadOrGhost("target")
 end
 
-local function IsVanillaNameplate(frame)
+-- Nameplate features (Nova Range, scaling, target border, team colors) live
+-- in one table to stay under Vanilla Lua's 200-local limit for the file.
+local NP = {}
+
+-- Master switch: with "MageCore nameplate styling" off, MageCore leaves the
+-- plates to the client, pfUI or ShaguTweaks and only draws Nova Range.
+function NP.StylingEnabled()
+    return MageCore_Config and MageCore_Config.NameplateFeatures
+end
+
+function NP.IsVanillaNameplate(frame)
     if not frame then return false end
     local objectType = frame:GetObjectType()
     if objectType ~= "Button" and objectType ~= "Frame" then return false end
+
+    -- SuperWoW exposes the unit GUID through GetName(1). TankPlates uses this
+    -- signature, and unlike the native border texture it remains available
+    -- after another nameplate addon has hidden or replaced the stock regions.
+    if frame.GetName and frame.GetChildren then
+        local ok, guid = pcall(frame.GetName, frame, 1)
+        local firstChild = frame:GetChildren()
+        if ok and guid and guid ~= "0x0000000000000000"
+            and firstChild and firstChild.GetObjectType
+            and firstChild:GetObjectType() == "StatusBar" then
+            return true
+        end
+    end
+
     -- ShaguTweaks identifies native plates, then reparents their regions into
     -- plate.new. Its cached fields remain the most reliable identifiers.
     if frame.healthbar and frame.name then return true end
@@ -542,14 +614,15 @@ local function IsVanillaNameplate(frame)
             and region:GetObjectType() == "Texture" then
             local texture = region:GetTexture()
             texture = texture and string.lower(string.gsub(texture, "/", "\\"))
-            if texture == "interface\\tooltips\\nameplate-border" then return true end
+            if texture and string.find(
+                texture, "nameplate-border", 1, true) then return true end
         end
     end
     return false
 end
 
-local function AddFrostNovaNameplate(parent)
-    if not parent or frostNovaNameplates[parent] then return end
+function NP.AddFrostNovaNameplate(parent)
+    if not parent or S.frostNovaNameplates[parent] then return end
     local originalHealth = parent.healthbar or parent:GetChildren()
     if not originalHealth then return end
 
@@ -620,7 +693,7 @@ local function AddFrostNovaNameplate(parent)
     targetRight:SetWidth(2)
     targetBorder:Hide()
 
-    frostNovaNameplates[parent] = {
+    S.frostNovaNameplates[parent] = {
         border = border,
         borderTextures = { top, bottom, left, right },
         anchor = nil,
@@ -628,28 +701,36 @@ local function AddFrostNovaNameplate(parent)
         sharpBorder = sharpBorder,
         sharpAnchor = nil,
         targetBorder = targetBorder,
+        targetBorderTextures = {
+            targetTop, targetBottom, targetLeft, targetRight
+        },
         targetAnchor = nil,
         originalHealth = originalHealth,
         scaleContainer = nil,
         containerBaseScale = nil,
         baseWidth = nil,
-        baseHeight = nil
+        baseHeight = nil,
+        visibilityUpdateHook = nil,
+        plateVisible = true
     }
 end
 
-local function DiscoverFrostNovaNameplates()
+function NP.DiscoverFrostNovaNameplates()
     local childCount = WorldFrame:GetNumChildren()
-    if childCount <= frostNovaNameplateCount then return end
+    if childCount <= S.frostNovaNameplateCount then return end
     local children = { WorldFrame:GetChildren() }
     local i
-    for i = frostNovaNameplateCount + 1, childCount do
+    -- WorldFrame:GetChildren() does not guarantee stable insertion order.
+    -- Rescan the full list when it grows so a newly allocated nameplate cannot
+    -- land before the previous child-count index and escape discovery.
+    for i = 1, childCount do
         local child = children[i]
-        if IsVanillaNameplate(child) then AddFrostNovaNameplate(child) end
+        if NP.IsVanillaNameplate(child) then NP.AddFrostNovaNameplate(child) end
     end
-    frostNovaNameplateCount = childCount
+    S.frostNovaNameplateCount = childCount
 end
 
-local function FrameHasUnitName(frame, unitName, depth)
+function NP.FrameHasUnitName(frame, unitName, depth)
     if not frame or not unitName then return false end
     local _, region
     for _, region in pairs({ frame:GetRegions() }) do
@@ -662,7 +743,7 @@ local function FrameHasUnitName(frame, unitName, depth)
     if depth < 2 then
         local _, child
         for _, child in pairs({ frame:GetChildren() }) do
-            if FrameHasUnitName(child, unitName, depth + 1) then
+            if NP.FrameHasUnitName(child, unitName, depth + 1) then
                 return true
             end
         end
@@ -670,24 +751,32 @@ local function FrameHasUnitName(frame, unitName, depth)
     return false
 end
 
-local function GetFrostNovaNameplateUnit(parent, entry)
+function NP.GetFrostNovaNameplateUnit(parent, entry)
     -- SuperWoW extends GetName(1) on nameplates to return the unit GUID.
     if parent.GetName then
         local ok, guid = pcall(parent.GetName, parent, 1)
-        if ok and guid and UnitExists(guid) then return guid end
+        -- UnitExists(guid) becomes unreliable for distant nameplates even
+        -- though SuperWoW's other unit functions still accept that GUID.
+        if ok and guid and guid ~= "0x0000000000000000" then return guid end
     end
-    -- Stock Vanilla cannot identify every nameplate. pfUI can still tell us
-    -- which plate is the current target, for which the normal token is exact.
-    if parent.nameplate and parent.nameplate.istarget and UnitExists("target") then
-        return "target"
+    -- Stock Vanilla cannot identify every nameplate. pfUI can still help find
+    -- the current target, but some SuperWoW/UI combinations leave istarget set
+    -- on more than one plate. Verify the displayed name before trusting it.
+    if parent.nameplate and parent.nameplate.istarget
+        and UnitExists("target") then
+        local targetName = UnitName("target")
+        if NP.FrameHasUnitName(parent, targetName)
+            or NP.FrameHasUnitName(entry.scaleContainer, targetName) then
+            return "target"
+        end
     end
     -- On the native Vanilla nameplates, the selected plate has full alpha.
     -- Matching its text as well avoids confusing same-area friendly plates.
     if UnitExists("target") and parent:GetAlpha() == 1 then
         local targetName = UnitName("target")
         if parent.name and parent.name:GetText() == targetName then return "target" end
-        if FrameHasUnitName(parent, targetName)
-            or FrameHasUnitName(entry.scaleContainer, targetName) then return "target" end
+        if NP.FrameHasUnitName(parent, targetName)
+            or NP.FrameHasUnitName(entry.scaleContainer, targetName) then return "target" end
 
         -- Some native/Shagu layouts do not expose their moved name region
         -- consistently. With a player targeted, the sole full-alpha plate is
@@ -698,12 +787,12 @@ local function GetFrostNovaNameplateUnit(parent, entry)
     return nil
 end
 
-local function HideFrostNovaRangeIndicators()
+function NP.HideFrostNovaRangeIndicators()
     local _, entry
-    for _, entry in pairs(frostNovaNameplates) do entry.border:Hide() end
+    for _, entry in pairs(S.frostNovaNameplates) do entry.border:Hide() end
 end
 
-local function MoveNameplateObjectToContainer(
+function NP.MoveNameplateObjectToContainer(
     object, parent, container, moveParent)
     if not object or object == container then return end
 
@@ -738,17 +827,17 @@ local function MoveNameplateObjectToContainer(
     end
 end
 
-local function MoveNameplateVisualsToContainer(parent, entry)
+function NP.MoveNameplateVisualsToContainer(parent, entry)
     local container = entry.scaleContainer
     if not container then return end
     local _, child
     for _, child in pairs({ parent:GetChildren() }) do
-        MoveNameplateObjectToContainer(
+        NP.MoveNameplateObjectToContainer(
             child, parent, container, child ~= container)
     end
     local _, region
     for _, region in pairs({ parent:GetRegions() }) do
-        MoveNameplateObjectToContainer(
+        NP.MoveNameplateObjectToContainer(
             region, parent, container, true)
     end
 
@@ -756,16 +845,52 @@ local function MoveNameplateVisualsToContainer(parent, entry)
     -- plate. Replace any remaining explicit anchors to the world plate with
     -- anchors to the movable visual container.
     for _, child in pairs({ container:GetChildren() }) do
-        MoveNameplateObjectToContainer(
+        NP.MoveNameplateObjectToContainer(
             child, parent, container, false)
     end
     for _, region in pairs({ container:GetRegions() }) do
-        MoveNameplateObjectToContainer(
+        NP.MoveNameplateObjectToContainer(
             region, parent, container, false)
     end
 end
 
-local function EnsureNameplateScaleContainer(parent, entry)
+function NP.CountRegions(frame)
+    return table.getn({ frame:GetRegions() })
+end
+
+-- Re-anchoring walks every child and region with GetPoint/SetPoint. Only do
+-- it when the plate's object counts change, plus a slow 2-second safety pass.
+function NP.MoveNameplateVisualsToContainerIfChanged(parent, entry)
+    local container = entry.scaleContainer
+    if not container then return end
+    local now = GetTime()
+    local signature = parent:GetNumChildren() .. ":" .. NP.CountRegions(parent)
+        .. ":" .. container:GetNumChildren() .. ":" .. NP.CountRegions(container)
+    if signature == entry.layoutSignature
+        and now < (entry.layoutCheckAt or 0) then
+        return
+    end
+    NP.MoveNameplateVisualsToContainer(parent, entry)
+    entry.layoutSignature = parent:GetNumChildren() .. ":"
+        .. NP.CountRegions(parent) .. ":" .. container:GetNumChildren()
+        .. ":" .. NP.CountRegions(container)
+    entry.layoutCheckAt = now + 2
+end
+
+function NP.EnsureNameplateScaleContainer(parent, entry)
+    -- pfUI's health-bar callbacks resolve their plate through
+    -- this:GetParent().nameplate. Never reparent pfUI-owned children; scale
+    -- and filter its overlay directly instead.
+    if parent.nameplate then
+        if entry.scaleContainer ~= parent.nameplate then
+            entry.scaleContainer = parent.nameplate
+            entry.containerBaseScale = parent.nameplate:GetScale() or 1
+            entry.baseWidth = nil
+            entry.baseHeight = nil
+        end
+        return
+    end
+
     if parent.new then
         if entry.scaleContainer ~= parent.new then
             entry.scaleContainer = parent.new
@@ -775,7 +900,7 @@ local function EnsureNameplateScaleContainer(parent, entry)
             entry.baseWidth = parent:GetWidth()
             entry.baseHeight = parent:GetHeight()
         end
-        MoveNameplateVisualsToContainer(parent, entry)
+        NP.MoveNameplateVisualsToContainerIfChanged(parent, entry)
         return
     end
 
@@ -795,55 +920,76 @@ local function EnsureNameplateScaleContainer(parent, entry)
         entry.baseWidth = parent:GetWidth()
         entry.baseHeight = parent:GetHeight()
     end
-    MoveNameplateVisualsToContainer(parent, entry)
+    NP.MoveNameplateVisualsToContainerIfChanged(parent, entry)
 end
 
-local function ApplyNameplateScale()
-    if not MageCore_Config then return end
+-- Applies size and raise to one plate. It runs on every frame after pfUI and
+-- ShaguTweaks have updated the plate, so their own scaling cannot make it
+-- jump, and it only touches anchors and sizes that actually differ.
+function NP.ApplyEntryScale(parent, entry)
     local percent = tonumber(MageCore_Config.NameplateScale) or 100
     percent = math.max(50, math.min(150, percent))
-    local parent, entry
-    for parent, entry in pairs(frostNovaNameplates) do
-        EnsureNameplateScaleContainer(parent, entry)
-        local verticalOffset = MageCore_Config.RaisedNameplates
-            and NAMEPLATE_VERTICAL_OFFSET or 0
+    local ratio = percent / 100
+    local verticalOffset = MageCore_Config.RaisedNameplates
+        and NAMEPLATE_VERTICAL_OFFSET or 0
 
-        -- pfUI draws the visible plate in this inner frame. Move that frame
-        -- directly, matching pfUI's own vertical-offset mechanism.
-        if parent.nameplate then
-            parent.nameplate:ClearAllPoints()
-            parent.nameplate:SetPoint(
-                "TOP", parent, "TOP", 0, verticalOffset)
+    -- pfUI draws the visible plate in this inner frame. Position and scale
+    -- that overlay without changing the ownership of any pfUI objects.
+    local target
+    if parent.nameplate then
+        target = parent.nameplate
+        local point, relativeTo, _, _, y = target:GetPoint(1)
+        if point ~= "TOP" or relativeTo ~= parent or y ~= verticalOffset
+            or target:GetNumPoints() ~= 1 then
+            target:ClearAllPoints()
+            target:SetPoint("TOP", parent, "TOP", 0, verticalOffset)
         end
-
-        if entry.scaleContainer and entry.containerBaseScale then
-            local ratio = percent / 100
-            -- Native/ShaguTweaks plates use the visual container itself.
-            local containerOffset = parent.nameplate and 0 or verticalOffset
-            entry.scaleContainer:ClearAllPoints()
-            entry.scaleContainer:SetPoint(
-                "BOTTOMLEFT", parent, "BOTTOMLEFT", 0, containerOffset)
-            entry.scaleContainer:SetPoint(
-                "TOPRIGHT", parent, "TOPRIGHT", 0, containerOffset)
-            -- Keep the parent's positional scale untouched, but resize its
-            -- layout box with the visuals so the above-head anchor stays valid.
-            if entry.baseWidth and entry.baseWidth > 0 then
-                parent:SetWidth(entry.baseWidth * ratio)
+    elseif entry.scaleContainer and entry.containerBaseScale then
+        target = entry.scaleContainer
+        if entry.appliedOffset ~= verticalOffset then
+            target:ClearAllPoints()
+            target:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", 0, verticalOffset)
+            target:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, verticalOffset)
+            entry.appliedOffset = verticalOffset
+        end
+        -- Keep the parent's positional scale untouched, but resize its
+        -- layout box with the visuals so the above-head anchor stays valid.
+        if entry.baseWidth and entry.baseWidth > 0 then
+            local width = entry.baseWidth * ratio
+            if math.abs((parent:GetWidth() or 0) - width) > 0.5 then
+                parent:SetWidth(width)
             end
-            if entry.baseHeight and entry.baseHeight > 0 then
-                parent:SetHeight(entry.baseHeight * ratio)
+        end
+        if entry.baseHeight and entry.baseHeight > 0 then
+            local height = entry.baseHeight * ratio
+            if math.abs((parent:GetHeight() or 0) - height) > 0.5 then
+                parent:SetHeight(height)
             end
-            entry.scaleContainer:SetScale(entry.containerBaseScale * percent / 100)
+        end
+    end
+    if target then
+        local scale = (entry.containerBaseScale or 1) * ratio
+        if math.abs((target:GetScale() or 1) - scale) > 0.001 then
+            target:SetScale(scale)
         end
     end
 end
 
-local function GetNameplateHealthBar(parent, entry)
+function NP.ApplyNameplateScale()
+    if not MageCore_Config or not MageCore_Config.NameplateFeatures then return end
+    local parent, entry
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        NP.EnsureNameplateScaleContainer(parent, entry)
+        NP.ApplyEntryScale(parent, entry)
+    end
+end
+
+function NP.GetNameplateHealthBar(parent, entry)
     return parent.nameplate and parent.nameplate.health
         or parent.healthbar or entry.originalHealth
 end
 
-local function GetNameplateDisplayedName(parent)
+function NP.GetNameplateDisplayedName(parent)
     local nameRegion = parent.name
     if parent.nameplate then
         nameRegion = parent.nameplate.original
@@ -855,8 +1001,8 @@ local function GetNameplateDisplayedName(parent)
         and nameRegion:GetText() or nil
 end
 
-local function GetKnownNameplatePlayer(parent)
-    local name = GetNameplateDisplayedName(parent)
+function NP.GetKnownNameplatePlayer(parent)
+    local name = NP.GetNameplateDisplayedName(parent)
     if not name then return false, nil end
 
     -- pfUI remembers whether a scanned nameplate belongs to a player.
@@ -876,10 +1022,11 @@ local function GetKnownNameplatePlayer(parent)
     return false, name
 end
 
-local function UpdateSharpNameplateEdges()
+function NP.UpdateSharpNameplateEdges()
+    local styling = NP.StylingEnabled()
     local parent, entry
-    for parent, entry in pairs(frostNovaNameplates) do
-        local anchor = GetNameplateHealthBar(parent, entry)
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        local anchor = NP.GetNameplateHealthBar(parent, entry)
         if anchor and anchor ~= entry.sharpAnchor then
             entry.sharpBorder:ClearAllPoints()
             entry.sharpBorder:SetPoint(
@@ -888,7 +1035,8 @@ local function UpdateSharpNameplateEdges()
                 "BOTTOMRIGHT", anchor, "BOTTOMRIGHT", 2, -2)
             entry.sharpAnchor = anchor
         end
-        if MageCore_Config.SharpNameplateEdges and parent:IsShown() then
+        if styling and MageCore_Config.SharpNameplateEdges
+            and entry.plateVisible and parent:IsShown() then
             entry.sharpBorder:Show()
         else
             entry.sharpBorder:Hide()
@@ -896,10 +1044,9 @@ local function UpdateSharpNameplateEdges()
     end
 end
 
-local function IsCurrentTargetNameplate(parent, entry, unit)
+function NP.IsCurrentTargetNameplate(parent, entry, unit)
     if not UnitExists("target") then return false end
     if unit == "target" then return true end
-    if parent.nameplate and parent.nameplate.istarget then return true end
 
     if unit then
         local _, targetGUID = UnitExists("target")
@@ -912,24 +1059,91 @@ local function IsCurrentTargetNameplate(parent, entry, unit)
     return false
 end
 
-local function UpdateTargetNameplateBorder()
+function NP.ApplyPfUINameColor(plate)
+    if not NP.StylingEnabled() then return end
+    if not plate or not plate.parent or not plate.name then return end
+    local entry = S.frostNovaNameplates[plate.parent]
+    if not entry then return end
+    local unit = entry.unit
+    if not entry.stateKnown then
+        unit = NP.GetFrostNovaNameplateUnit(plate.parent, entry)
+    end
+    if not unit then return end
+    local colorUnit = unit == "target" and "target" or unit
+
+    local red, green, blue
+    if colorUnit == "target" then
+        local colorOK
+        colorOK, red, green, blue = pcall(
+            UnitSelectionColor, "target")
+        if not colorOK then red, green, blue = nil, nil, nil end
+    else
+        -- UnitSelectionColor returns white for many untargeted SuperWoW GUIDs.
+        -- UnitReaction retains the actual faction relationship at that range.
+        local reactionOK, reaction = pcall(
+            UnitReaction, "player", colorUnit)
+        if reactionOK and reaction then
+            if reaction <= 3 then
+                red, green, blue = 1, 0.2, 0.2
+            elseif reaction == 4 then
+                red, green, blue = 1, 1, 0
+            else
+                red, green, blue = 0, 1, 0
+            end
+        end
+    end
+    if not red or not green or not blue then
+        local health = plate.original and plate.original.healthbar
+            or plate.health
+        if health and health.GetStatusBarColor then
+            red, green, blue = health:GetStatusBarColor()
+        end
+    end
+    if red and green and blue then
+        plate.name:SetTextColor(red, green, blue, 1)
+    end
+end
+
+function NP.EnsurePfUINameColorHook()
+    if not pfUI or not pfUI.nameplates
+        or not pfUI.nameplates.OnDataChanged then return end
+    local current = pfUI.nameplates.OnDataChanged
+    if current == S.pfUINameplateColorHook then return end
+    local previous = current
+    local wrapper = function(self, plate)
+        previous(self, plate)
+        NP.ApplyPfUINameColor(plate)
+    end
+    S.pfUINameplateColorHook = wrapper
+    pfUI.nameplates.OnDataChanged = wrapper
+end
+
+function NP.UpdateTargetNameplateBorder()
+    local styling = NP.StylingEnabled()
     local parent, entry
-    for parent, entry in pairs(frostNovaNameplates) do
-        local anchor = GetNameplateHealthBar(parent, entry)
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        local anchor = NP.GetNameplateHealthBar(parent, entry)
         if anchor and anchor ~= entry.targetAnchor then
             entry.targetBorder:ClearAllPoints()
             entry.targetBorder:SetPoint(
-                "TOPLEFT", anchor, "TOPLEFT", -10, 10)
+                "TOPLEFT", anchor, "TOPLEFT", -3, 3)
             entry.targetBorder:SetPoint(
-                "BOTTOMRIGHT", anchor, "BOTTOMRIGHT", 10, -10)
+                "BOTTOMRIGHT", anchor, "BOTTOMRIGHT", 3, -3)
             entry.targetAnchor = anchor
         end
 
-        local unit = parent:IsShown()
-            and GetFrostNovaNameplateUnit(parent, entry)
-        if MageCore_Config.HighlightTargetNameplate
+        local unit = parent:IsShown() and entry.unit
+        if styling and MageCore_Config.HighlightTargetNameplate
             and parent:IsShown()
-            and IsCurrentTargetNameplate(parent, entry, unit) then
+            and NP.IsCurrentTargetNameplate(parent, entry, unit) then
+            local colorOK, red, green, blue = pcall(
+                UnitSelectionColor, "target")
+            if colorOK and red and green and blue then
+                local _, texture
+                for _, texture in pairs(entry.targetBorderTextures) do
+                    texture:SetTexture(red, green, blue, 1)
+                end
+            end
             entry.targetBorder:Show()
         else
             entry.targetBorder:Hide()
@@ -937,8 +1151,29 @@ local function UpdateTargetNameplateBorder()
     end
 end
 
-local function GetNameplateDisposition(parent, entry, unit)
-    local health = GetNameplateHealthBar(parent, entry)
+-- Far-away GUIDs sometimes answer unit queries and sometimes do not. Keep
+-- the last known answer per GUID so a plate does not flip colors or switch
+-- between full and name-only mode while the unit is far away.
+function NP.RememberDisposition(unit, disposition)
+    if type(unit) ~= "string" or string.sub(unit, 1, 2) ~= "0x" then
+        return disposition
+    end
+    if disposition then
+        if not S.guidDispositions[unit] then
+            S.guidDispositionCount = S.guidDispositionCount + 1
+            if S.guidDispositionCount > 1000 then
+                S.guidDispositions = {}
+                S.guidDispositionCount = 1
+            end
+        end
+        S.guidDispositions[unit] = disposition
+        return disposition
+    end
+    return S.guidDispositions[unit]
+end
+
+function NP.GetNameplateDisposition(parent, entry, unit)
+    local health = NP.GetNameplateHealthBar(parent, entry)
     if not health then return nil end
 
     local disposition
@@ -967,7 +1202,7 @@ local function GetNameplateDisposition(parent, entry, unit)
             end
 
             entry.playerName = UnitName(unit)
-                or GetNameplateDisplayedName(parent)
+                or NP.GetNameplateDisplayedName(parent)
             entry.playerDisposition = playerDisposition
             return playerDisposition
         end
@@ -987,8 +1222,9 @@ local function GetNameplateDisposition(parent, entry, unit)
             end
         end
 
-        -- Friendly players can use a blue selection circle, so keep reaction
-        -- as a fallback for colors that were not identified above.
+        -- Friendly players can use a blue selection circle, and distant
+        -- SuperWoW GUIDs often report a white circle, so fall back to the
+        -- faction reaction, which stays available at long range.
         if not disposition then
             local reactionOK, reaction = pcall(
                 UnitReaction, "player", unit)
@@ -997,12 +1233,18 @@ local function GetNameplateDisposition(parent, entry, unit)
                     disposition = "HOSTILE"
                 elseif reaction >= 5 then
                     disposition = "FRIENDLY"
+                else
+                    -- Neutral creatures turn red once they are in combat.
+                    local combatOK, inCombat = pcall(UnitAffectingCombat, unit)
+                    disposition = (combatOK and inCombat)
+                        and "HOSTILE" or "NEUTRAL"
                 end
             end
         end
+        disposition = NP.RememberDisposition(unit, disposition)
     elseif health.GetStatusBarColor then
         local knownPlayer, plateName =
-            GetKnownNameplatePlayer(parent)
+            NP.GetKnownNameplatePlayer(parent)
         if entry.playerName and entry.playerName ~= plateName then
             entry.playerName = nil
             entry.playerDisposition = nil
@@ -1038,10 +1280,10 @@ local function GetNameplateDisposition(parent, entry, unit)
     return disposition
 end
 
-local function UpdateNameplateTeamColor(parent, entry, unit)
-    local health = GetNameplateHealthBar(parent, entry)
+function NP.UpdateNameplateTeamColor(parent, entry)
+    local health = NP.GetNameplateHealthBar(parent, entry)
     if not health or not health.SetStatusBarColor then return end
-    local disposition = GetNameplateDisposition(parent, entry, unit)
+    local disposition = entry.disposition
 
     if disposition == "HOSTILE" then
         health:SetStatusBarColor(1, 0, 0)
@@ -1054,25 +1296,218 @@ local function UpdateNameplateTeamColor(parent, entry, unit)
     end
 end
 
-local function ApplyNameplateVisibility()
-    if not MageCore_Config then return end
+function NP.ApplyNameplateVisibility()
+    if not NP.StylingEnabled() then return end
 
     -- Vanilla 1.12 exposes nameplate visibility through functions rather than
-    -- the newer nameplateShowEnemies/nameplateShowFriends CVars.
-    if MageCore_Config.AlwaysShowNameplates then
+    -- the newer nameplateShowEnemies/nameplateShowFriends CVars. Keep both
+    -- types allocated in target-only mode even without a target: MageCore
+    -- turns non-target pfUI plates into scalable name-only displays.
+    if MageCore_Config.AlwaysShowNameplates
+        or MageCore_Config.HighlightTargetNameplate then
         if ShowNameplates then ShowNameplates() end
     elseif HideNameplates then
         HideNameplates()
     end
 
-    if MageCore_Config.ShowFriendlyNameplates then
+    if MageCore_Config.ShowFriendlyNameplates
+        or MageCore_Config.HighlightTargetNameplate then
         if ShowFriendNameplates then ShowFriendNameplates() end
     elseif HideFriendNameplates then
         HideFriendNameplates()
     end
 end
 
-local function IsUnitInFrostNovaRange(unit)
+function NP.SetPfFont(entry, fontString, key, enlarged)
+    if not fontString or not fontString.GetFont
+        or not fontString.SetFont then return end
+    if not entry[key] then
+        local path, size, flags = fontString:GetFont()
+        if path and size then entry[key] = { path, size, flags } end
+    end
+    local font = entry[key]
+    if font then
+        local wanted = font[2]
+            * (enlarged and NON_TARGET_NAME_FONT_SCALE or 1)
+        -- SetFont rebuilds the glyph cache, so only call it on a change.
+        local _, currentSize = fontString:GetFont()
+        if not currentSize or math.abs(currentSize - wanted) > 0.01 then
+            fontString:SetFont(font[1], wanted, font[3])
+        end
+    end
+end
+
+function NP.ComputeNameplateVisibility(parent, entry)
+    local visible = false
+    local currentTarget = false
+    if not NP.StylingEnabled() then
+        visible = parent:IsShown()
+    elseif parent:IsShown() then
+        if MageCore_Config.HighlightTargetNameplate
+            and NP.IsCurrentTargetNameplate(parent, entry, entry.unit) then
+            visible = true
+            currentTarget = true
+        elseif entry.disposition == "FRIENDLY" then
+            visible = MageCore_Config.ShowFriendlyNameplates
+        else
+            -- Hostile, neutral, and unidentified native plates are
+            -- controlled by the enemy-nameplate setting.
+            visible = MageCore_Config.AlwaysShowNameplates
+        end
+    end
+    entry.plateVisible = visible and true or false
+    entry.isCurrentTarget = currentTarget
+end
+
+-- Unit identification is the expensive part of nameplate handling. It runs
+-- on the 0.1s tick, on target changes, and immediately when a recycled
+-- plate starts showing a different name; per-frame code reuses the result.
+function NP.RefreshNameplateEntry(parent, entry)
+    if parent:IsShown() then
+        entry.unit = NP.GetFrostNovaNameplateUnit(parent, entry)
+        entry.disposition = NP.GetNameplateDisposition(parent, entry, entry.unit)
+    else
+        entry.unit = nil
+        entry.disposition = nil
+    end
+    entry.stateName = NP.GetNameplateDisplayedName(parent)
+    entry.stateKnown = true
+    NP.ComputeNameplateVisibility(parent, entry)
+end
+
+function NP.RefreshNameplateStates()
+    local parent, entry
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        NP.RefreshNameplateEntry(parent, entry)
+    end
+end
+
+function NP.RenderNameplateVisibility(parent, entry)
+    -- Other addons can chain this plate's OnUpdate more than once; one
+    -- render per frame is enough.
+    local now = GetTime()
+    if entry.renderedAt == now then return end
+    entry.renderedAt = now
+    if not NP.StylingEnabled() then return end
+    if parent:IsShown()
+        and NP.GetNameplateDisplayedName(parent) ~= entry.stateName then
+        NP.RefreshNameplateEntry(parent, entry)
+    end
+    NP.ApplyEntryScale(parent, entry)
+
+    -- pfUI redraws and explicitly shows its nameplate child on every
+    -- update. For non-targets, retain its ordinary floating name while
+    -- hiding the actual plate instead of hiding the complete overlay.
+    local pfPlate = parent.nameplate
+    if entry.plateVisible then
+        if pfPlate then
+            NP.SetPfFont(entry, pfPlate.name, "pfNameFont", false)
+            NP.SetPfFont(entry, pfPlate.level, "pfLevelFont", false)
+            -- Restore the normal pfUI hierarchy after this recycled plate
+            -- previously spent time in MageCore's name-only mode.
+            if pfPlate.health then
+                if pfPlate.name then
+                    pfPlate.name:SetParent(pfPlate.health)
+                    if entry.isCurrentTarget then
+                        NP.ApplyPfUINameColor(pfPlate)
+                    end
+                    pfPlate.name:Show()
+                end
+                if pfPlate.level then
+                    pfPlate.level:ClearAllPoints()
+                    pfPlate.level:SetPoint(
+                        "RIGHT", pfPlate.health, "LEFT", -5, 0)
+                    pfPlate.level:Show()
+                end
+                pfPlate.health:Show()
+            end
+        end
+        if entry.scaleContainer then entry.scaleContainer:Show() end
+        if pfPlate then pfPlate:Show() end
+    elseif pfPlate then
+        pfPlate:Show()
+        if pfPlate.name then
+            NP.SetPfFont(entry, pfPlate.name, "pfNameFont", true)
+            pfPlate.name:SetParent(pfPlate)
+            NP.ApplyPfUINameColor(pfPlate)
+            pfPlate.name:Show()
+        end
+        if pfPlate.level then
+            NP.SetPfFont(entry, pfPlate.level, "pfLevelFont", true)
+            pfPlate.level:ClearAllPoints()
+            pfPlate.level:SetPoint(
+                "RIGHT", pfPlate.name, "LEFT", -3, 0)
+            pfPlate.level:Show()
+        end
+        if pfPlate.health then pfPlate.health:Hide() end
+        if pfPlate.glow then pfPlate.glow:Hide() end
+        if pfPlate.totem then pfPlate.totem:Hide() end
+        if pfPlate.castbar then pfPlate.castbar:Hide() end
+        local _, debuff
+        for _, debuff in pairs(pfPlate.debuffs or {}) do
+            debuff:Hide()
+        end
+        local _, combo
+        for _, combo in pairs(pfPlate.combopoints or {}) do
+            combo:Hide()
+        end
+        entry.border:Hide()
+        entry.sharpBorder:Hide()
+        entry.targetBorder:Hide()
+    else
+        if entry.scaleContainer then entry.scaleContainer:Hide() end
+    end
+end
+
+function NP.ApplyTargetOnlyNameplateVisibility(refreshUnits)
+    if not MageCore_Config then return end
+    if refreshUnits then NP.RefreshNameplateStates() end
+
+    local parent, entry
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        if parent.GetScript and parent.SetScript then
+            local currentUpdate = parent:GetScript("OnUpdate")
+            if currentUpdate ~= entry.visibilityUpdateHook then
+                local previousUpdate = currentUpdate
+                local hookedParent = parent
+                local hookedEntry = entry
+                local wrapper = function()
+                    if previousUpdate then previousUpdate() end
+                    NP.RenderNameplateVisibility(hookedParent, hookedEntry)
+                end
+                entry.visibilityUpdateHook = wrapper
+                parent:SetScript("OnUpdate", wrapper)
+            end
+        end
+        if not entry.stateKnown then NP.RefreshNameplateEntry(parent, entry) end
+        NP.ComputeNameplateVisibility(parent, entry)
+        entry.renderedAt = nil
+        NP.RenderNameplateVisibility(parent, entry)
+    end
+end
+
+function NP.PrintNameplateDebug()
+    NP.DiscoverFrostNovaNameplates()
+    local tracked, shown, targets, containers, pfPlates = 0, 0, 0, 0, 0
+    local parent, entry
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        tracked = tracked + 1
+        if parent:IsShown() then shown = shown + 1 end
+        if entry.scaleContainer then containers = containers + 1 end
+        if parent.nameplate then pfPlates = pfPlates + 1 end
+        local unit = NP.GetFrostNovaNameplateUnit(parent, entry)
+        if NP.IsCurrentTargetNameplate(parent, entry, unit) then
+            targets = targets + 1
+        end
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(
+        ACCENT .. "[MageCore]|r plates: world="
+            .. WorldFrame:GetNumChildren() .. ", tracked=" .. tracked
+            .. ", shown=" .. shown .. ", targets=" .. targets
+            .. ", containers=" .. containers .. ", pfUI=" .. pfPlates)
+end
+
+function NP.IsUnitInFrostNovaRange(unit)
     local hostileOK, hostile = pcall(UnitCanAttack, "player", unit)
     local deadOK, dead = pcall(UnitIsDeadOrGhost, unit)
     if not hostileOK or not hostile or not deadOK or dead then return false end
@@ -1086,7 +1521,7 @@ local function IsUnitInFrostNovaRange(unit)
             local deltaX = playerX - unitX
             local deltaY = playerY - unitY
             if deltaX * deltaX + deltaY * deltaY
-                <= frostNovaRangeYards * frostNovaRangeYards then
+                <= S.frostNovaRangeYards * S.frostNovaRangeYards then
                 return true
             end
             -- Coordinates measure center to center. Do not reject the spell
@@ -1096,18 +1531,18 @@ local function IsUnitInFrostNovaRange(unit)
     end
 
     -- Indices 3 and 2 are approximately 9.9 and 11.1 yards respectively.
-    local rangeOK, inRange = pcall(CheckInteractDistance, unit, frostNovaRangeDistanceIndex)
+    local rangeOK, inRange = pcall(CheckInteractDistance, unit, S.frostNovaRangeDistanceIndex)
     return rangeOK and inRange
 end
 
-local function SetFrostNovaBorderColor(entry, red, green, blue)
+function NP.SetFrostNovaBorderColor(entry, red, green, blue)
     local _, texture
     for _, texture in pairs(entry.borderTextures) do
         texture:SetTexture(red, green, blue, 1)
     end
 end
 
-local function SetFrostNovaBorderThickness(entry, anchor, thickness)
+function NP.SetFrostNovaBorderThickness(entry, anchor, thickness)
     if not anchor then return end
     if anchor ~= entry.anchor or thickness ~= entry.borderThickness then
         entry.border:ClearAllPoints()
@@ -1125,43 +1560,39 @@ local function SetFrostNovaBorderThickness(entry, anchor, thickness)
     end
 end
 
-local function UpdateFrostNovaRangeIndicators()
-    DiscoverFrostNovaNameplates()
+function NP.UpdateFrostNovaRangeIndicators()
+    NP.DiscoverFrostNovaNameplates()
     if not MageCore_Config then return end
-    ApplyNameplateScale()
-    UpdateSharpNameplateEdges()
-    UpdateTargetNameplateBorder()
+    NP.EnsurePfUINameColorHook()
+    -- Identify every plate's unit once; all passes below reuse it.
+    NP.RefreshNameplateStates()
+    NP.ApplyNameplateScale()
+    NP.UpdateSharpNameplateEdges()
+    NP.UpdateTargetNameplateBorder()
 
     local parent, entry
-    for parent, entry in pairs(frostNovaNameplates) do
-        if parent:IsShown() and MageCore_Config.TeamNameplateColors then
-            UpdateNameplateTeamColor(
-                parent, entry, GetFrostNovaNameplateUnit(parent, entry))
+    if NP.StylingEnabled() and MageCore_Config.TeamNameplateColors then
+        for parent, entry in pairs(S.frostNovaNameplates) do
+            if parent:IsShown() then NP.UpdateNameplateTeamColor(parent, entry) end
         end
     end
+    NP.ApplyTargetOnlyNameplateVisibility(false)
 
     if not MageCore_Config.FrostNovaRange then
-        HideFrostNovaRangeIndicators()
+        NP.HideFrostNovaRangeIndicators()
         return
     end
 
-    for parent, entry in pairs(frostNovaNameplates) do
-        local anchor = GetNameplateHealthBar(parent, entry)
-
-        local unit = parent:IsShown() and GetFrostNovaNameplateUnit(parent, entry)
-        local disposition = parent:IsShown()
-            and GetNameplateDisposition(parent, entry, unit)
-        if disposition == "HOSTILE" then
-            if unit and IsUnitInFrostNovaRange(unit) then
-                -- A steady green state is immediately distinguishable from
-                -- the steady-red longer-range state.
-                SetFrostNovaBorderThickness(entry, anchor, 6)
-                SetFrostNovaBorderColor(entry, 0, 1, 0)
-            else
-                -- Use the same strong outline in steady red at longer range.
-                SetFrostNovaBorderThickness(entry, anchor, 3)
-                SetFrostNovaBorderColor(entry, 1, 0, 0)
-            end
+    for parent, entry in pairs(S.frostNovaNameplates) do
+        local anchor = NP.GetNameplateHealthBar(parent, entry)
+        local unit = parent:IsShown() and entry.unit
+        -- Only enemies you can actually reach with Frost Nova are marked;
+        -- an outline on every distant enemy was noise, not information.
+        if entry.plateVisible and parent:IsShown()
+            and entry.disposition == "HOSTILE"
+            and unit and NP.IsUnitInFrostNovaRange(unit) then
+            NP.SetFrostNovaBorderThickness(entry, anchor, 2)
+            NP.SetFrostNovaBorderColor(entry, 0.2, 1, 0.2)
             entry.border:Show()
         else
             entry.border:Hide()
@@ -1273,6 +1704,10 @@ local function ShouldGoDirectToPvpRotation()
 end
 
 local function IsInBattleground()
+    if IsInInstance then
+        local _, instanceType = IsInInstance()
+        if instanceType == "pvp" then return true end
+    end
     if not GetBattlefieldStatus then return false end
     local i
     for i = 1, 3 do
@@ -1335,16 +1770,16 @@ local function GetFireWardAction()
     local targetKey = GetTargetKey()
     local targetSpell = GetTargetCastingSpellInfo()
     if IsFireThreatSpellName(targetSpell) then
-        fireThreatTargets[targetKey] =
+        S.fireThreatTargets[targetKey] =
             GetTime() + FIRE_THREAT_MEMORY_SECONDS
     end
 
     local isFireThreat = false
-    local rememberedUntil = fireThreatTargets[targetKey]
+    local rememberedUntil = S.fireThreatTargets[targetKey]
     if rememberedUntil and rememberedUntil > GetTime() then
         isFireThreat = true
     elseif rememberedUntil then
-        fireThreatTargets[targetKey] = nil
+        S.fireThreatTargets[targetKey] = nil
     end
 
     local classToken = GetTargetClassToken()
@@ -1363,8 +1798,42 @@ local function GetFireWardAction()
     return GetReadyWardAction("Fire Ward")
 end
 
+-- Action-bar contents rarely change. Index the 120 slots by icon once and
+-- reuse it until ACTIONBAR_SLOT_CHANGED (or a 5-second safety refresh).
+local function GetActionSlotsForTexture(texture, includeMacros)
+    local wanted = NormalizeTexture(texture)
+    if not wanted then return {} end
+    local now = GetTime()
+    if not S.actionSlotIndex or now >= (S.actionSlotIndexExpires or 0) then
+        local index = {}
+        local slot
+        for slot = 1, 120 do
+            local slotTexture = GetActionTexture(slot)
+            if slotTexture then
+                local key = NormalizeTexture(slotTexture)
+                index[key] = index[key] or {}
+                table.insert(index[key], {
+                    slot = slot, macro = GetActionText(slot) ~= nil
+                })
+            end
+        end
+        S.actionSlotIndex = index
+        S.actionSlotIndexExpires = now + 5
+    end
+    local result = {}
+    local _, entry
+    for _, entry in ipairs(S.actionSlotIndex[wanted] or {}) do
+        -- Macros (including MageRot itself) can share a spell's icon but do
+        -- not report that spell's range or reactive state.
+        if includeMacros or not entry.macro then
+            table.insert(result, entry.slot)
+        end
+    end
+    return result
+end
+
 local function GetSpellRangeState(spellName)
-    if not HasLivingEnemyTarget() then return nil end
+    if not spellName or not HasLivingEnemyTarget() then return nil end
 
     -- Some Turtle clients expose the later helper even though stock 1.12 does
     -- not. Use it when present, then fall back to matching action-bar spells.
@@ -1375,18 +1844,13 @@ local function GetSpellRangeState(spellName)
     end
 
     if IsActionInRange then
-        local wantedTexture = NormalizeTexture(GetSpellTextureByName(spellName))
         local foundInRange = false
-        local slot
-        for slot = 1, 120 do
-            local texture = GetActionTexture(slot)
-            -- Ignore macros (including MageRot itself) that merely share the
-            -- dynamic spell icon; only native spell actions report useful range.
-            if texture and not GetActionText(slot) and NormalizeTexture(texture) == wantedTexture then
-                local state = IsActionInRange(slot)
-                if state == 0 then return false end
-                if state == 1 then foundInRange = true end
-            end
+        local _, slot
+        for _, slot in ipairs(GetActionSlotsForTexture(
+            GetSpellTextureByName(spellName))) do
+            local state = IsActionInRange(slot)
+            if state == 0 then return false end
+            if state == 1 then foundInRange = true end
         end
         if foundInRange then return true end
     end
@@ -1394,10 +1858,10 @@ local function GetSpellRangeState(spellName)
 end
 
 local function IsRangeBlocked(spellName)
-    local blocked = rangeBlockedSpells[spellName]
+    local blocked = S.rangeBlockedSpells[spellName]
     if not blocked then return false end
     if blocked.target ~= GetTargetKey() or GetTime() >= blocked.expires then
-        rangeBlockedSpells[spellName] = nil
+        S.rangeBlockedSpells[spellName] = nil
         return false
     end
     return true
@@ -1409,7 +1873,7 @@ local function SpellCanReachTarget(spellName)
     -- spell range APIs commonly return no result. Arctic Reach modifies it by
     -- the same amount as Frost Nova, allowing both to share this range check.
     if spellName == "Cone of Cold" then
-        return HasLivingEnemyTarget() and IsUnitInFrostNovaRange("target")
+        return HasLivingEnemyTarget() and NP.IsUnitInFrostNovaRange("target")
     end
     return GetSpellRangeState(spellName) ~= false
 end
@@ -1432,15 +1896,11 @@ local function ConfiguredSpellIsAutoRepeat(spellName)
 end
 
 local function IsConfiguredAutoRepeatActive(spellName)
-    if autoRepeatActive then return true end
-    local repeatTexture = NormalizeTexture(GetSpellTextureByName(spellName))
-    if not repeatTexture then return false end
-    local slot
-    for slot = 1, 120 do
-        local texture = GetActionTexture(slot)
-        if texture and NormalizeTexture(texture) == repeatTexture and IsCurrentAction(slot) then
-            return true
-        end
+    if S.autoRepeatActive then return true end
+    local _, slot
+    for _, slot in ipairs(GetActionSlotsForTexture(
+        GetSpellTextureByName(spellName), true)) do
+        if IsCurrentAction(slot) then return true end
     end
     return false
 end
@@ -1475,18 +1935,69 @@ local function LoadDefaults()
     if MageCore_Config.FoodMaximum == nil then
         MageCore_Config.FoodMaximum = math.max(80, tonumber(MageCore_Config.FoodMinimum) or 0)
     end
-    if MageCore_Config.AutoConjureManaAgate == nil then
-        MageCore_Config.AutoConjureManaAgate = false
+    -- v1.6: the Mana Agate option now covers every mana gem.
+    if MageCore_Config.AutoManaGems == nil then
+        MageCore_Config.AutoManaGems =
+            MageCore_Config.AutoConjureManaAgate and true or false
     end
+    if MageCore_Config.ManaGemManaThreshold == nil then
+        MageCore_Config.ManaGemManaThreshold =
+            MageCore_Config.ManaAgateManaThreshold or 500
+    end
+    MageCore_Config.AutoConjureManaAgate = nil
+    MageCore_Config.ManaAgateManaThreshold = nil
+    MageCore_Config.ManaGemManaThreshold = math.max(
+        0, math.min(9999,
+            tonumber(MageCore_Config.ManaGemManaThreshold) or 500))
     if MageCore_Config.AutoDefilersTalisman == nil then
         MageCore_Config.AutoDefilersTalisman = false
     end
     if MageCore_Config.DefilersTalismanHealthLostPercent == nil then
         MageCore_Config.DefilersTalismanHealthLostPercent = 20
     end
-    if MageCore_Config.HealingPotionHealthLostPercent == nil then
-        MageCore_Config.HealingPotionHealthLostPercent = 0
+    -- v1.6: renamed; the value always meant "current health %".
+    if MageCore_Config.HealingPotionHealthPercent == nil then
+        MageCore_Config.HealingPotionHealthPercent =
+            MageCore_Config.HealingPotionHealthLostPercent or 0
     end
+    MageCore_Config.HealingPotionHealthLostPercent = nil
+    if MageCore_Config.AutoTargetEnemy == nil then
+        MageCore_Config.AutoTargetEnemy = true
+    end
+    if MageCore_Config.PvPBurst == nil then MageCore_Config.PvPBurst = true end
+    if MageCore_Config.PvPReslow == nil then MageCore_Config.PvPReslow = true end
+    if MageCore_Config.PvPTargetPlayersOnly == nil then
+        MageCore_Config.PvPTargetPlayersOnly = true
+    end
+    if MageCore_Config.AutoArcaneSurge == nil then
+        MageCore_Config.AutoArcaneSurge = true
+    end
+    if MageCore_Config.AutoEvocation == nil then
+        MageCore_Config.AutoEvocation = false
+    end
+    if MageCore_Config.EvocationManaPercent == nil then
+        MageCore_Config.EvocationManaPercent = 10
+    end
+    if MageCore_Config.AutoDefensiveShield == nil then
+        MageCore_Config.AutoDefensiveShield = false
+    end
+    if MageCore_Config.DefensiveShieldHealthPercent == nil then
+        MageCore_Config.DefensiveShieldHealthPercent = 40
+    end
+    if MageCore_Config.Profiles == nil then MageCore_Config.Profiles = {} end
+    if MageCore_Config.XPBarShown == nil then MageCore_Config.XPBarShown = false end
+    if MageCore_Config.NameplateFeatures == nil then
+        MageCore_Config.NameplateFeatures = true
+    end
+    if MageCore_Config.XPBarLocked == nil then MageCore_Config.XPBarLocked = false end
+    if MageCore_Config.XPBarX == nil then MageCore_Config.XPBarX = 0 end
+    if MageCore_Config.XPBarY == nil then MageCore_Config.XPBarY = -200 end
+    if MageCore_Config.XPBarScale == nil then MageCore_Config.XPBarScale = 100 end
+    if MageCore_Config.CastBarShown == nil then MageCore_Config.CastBarShown = false end
+    if MageCore_Config.CastBarLocked == nil then MageCore_Config.CastBarLocked = false end
+    if MageCore_Config.CastBarX == nil then MageCore_Config.CastBarX = 0 end
+    if MageCore_Config.CastBarY == nil then MageCore_Config.CastBarY = -150 end
+    if MageCore_Config.CastBarScale == nil then MageCore_Config.CastBarScale = 100 end
     MageCore_Config.WaterMaximum = math.max(
         tonumber(MageCore_Config.WaterMinimum) or 0,
         tonumber(MageCore_Config.WaterMaximum) or 0
@@ -1581,6 +2092,17 @@ local function LoadDefaults()
     )
     if MageCore_Config.AutoCounterspell == nil then MageCore_Config.AutoCounterspell = false end
     if MageCore_Config.CounterspellHealingOnly == nil then MageCore_Config.CounterspellHealingOnly = false end
+    S.configTable = MageCore_Config
+end
+
+-- Defaults and migrations run once when saved variables load. Hot paths only
+-- need this cheap guard instead of re-running every migration on each press.
+local function EnsureConfig()
+    -- Comparing the table itself also catches saved variables replacing the
+    -- table after an early call, and /mc reset installing a new one.
+    if not MageCore_Config or S.configTable ~= MageCore_Config then
+        LoadDefaults()
+    end
 end
 
 local function GetGroupUnitKey(unit)
@@ -1607,9 +2129,9 @@ local function IsFriendlyBuffTarget(unit, skipRangeCheck)
     if not skipRangeCheck and CheckInteractDistance
         and not CheckInteractDistance(unit, 4) then return false end
     local key = GetGroupUnitKey(unit)
-    local blockedUntil = groupBlockedUnits[key]
+    local blockedUntil = S.groupBlockedUnits[key]
     if blockedUntil and GetTime() < blockedUntil then return false end
-    if blockedUntil then groupBlockedUnits[key] = nil end
+    if blockedUntil then S.groupBlockedUnits[key] = nil end
     return true
 end
 
@@ -1744,7 +2266,7 @@ local function GetNextTargetedMagicAction()
 end
 
 local function GetNextBuffAction()
-    LoadDefaults()
+    EnsureConfig()
     local targetedSpell, targetedUnit = GetNextTargetedMagicAction()
     if targetedSpell then return targetedSpell, targetedUnit end
 
@@ -1790,7 +2312,12 @@ local function GetBuffDisplaySpell()
     return nil
 end
 
+-- With "Surge on proc" enabled (the default), Rotation casts Arcane Surge as
+-- soon as a resist proc is available, without it occupying a Rotation slot.
+-- When disabled, Rotation only uses it if a slot is set to Arcane Surge.
+-- The Arcane Explosion button always uses a Surge proc.
 local function IsArcaneSurgeConfigured()
+    if MageCore_Config.AutoArcaneSurge then return true end
     local i
     for i = 1, 6 do
         if MageCore_Config["Rotation" .. i] == "Arcane Surge" then
@@ -1800,45 +2327,50 @@ local function IsArcaneSurgeConfigured()
     return false
 end
 
-local function GetArcaneSurgeActionSlotState()
-    local wantedTexture = NormalizeTexture(
-        GetSpellTextureByName("Arcane Surge"))
-    if not wantedTexture then return nil, nil end
-
-    local slot
-    for slot = 1, 120 do
-        local texture = GetActionTexture(slot)
-        if texture and not GetActionText(slot)
-            and NormalizeTexture(texture) == wantedTexture then
-            local usable, notEnoughMana = IsUsableAction(slot)
-            local start, duration = GetActionCooldown(slot)
-            local offCooldown = not start or not duration
-                or start == 0 or duration == 0
-                or start + duration <= GetTime()
-            return usable == 1 and not notEnoughMana and offCooldown, slot
-        end
-    end
-    return nil, nil
+-- Only a real cooldown blocks Surge here, not the shared global cooldown:
+-- the proc itself must be recognised the moment it appears.
+local function IsOnRealCooldown(start, duration)
+    return start and duration and start > 0 and duration > 1.5
+        and start + duration > GetTime()
 end
 
-local function GetArcaneSurgeAction(ignoreRotationConfiguration)
-    local usable = GetArcaneSurgeActionSlotState()
+local function GetArcaneSurgeActionSlotState()
+    local slot = GetActionSlotsForTexture(
+        GetSpellTextureByName("Arcane Surge"))[1]
+    if not slot then return nil, nil end
+    local usable, notEnoughMana = IsUsableAction(slot)
+    local start, duration = GetActionCooldown(slot)
+    return usable == 1 and not notEnoughMana
+        and not IsOnRealCooldown(start, duration), slot
+end
+
+-- requireCastableNow is only set while Arcane Missiles is channeling: then
+-- the channel is cancelled only when Surge can be cast at once. Otherwise a
+-- proc is chosen even during the global cooldown, so the next press (or the
+-- client's spell queue) casts Surge instead of another rotation spell.
+local function GetArcaneSurgeAction(ignoreRotationConfiguration, requireCastableNow)
+    if not ignoreRotationConfiguration and not IsArcaneSurgeConfigured() then
+        return nil
+    end
+    if not HasLivingEnemyTarget() then return nil end
     -- Vanilla exposes reactive conditions most reliably through an actual
     -- action-bar spell slot. Combat-log tracking covers characters that keep
-    -- Arcane Surge only in MageCore's rotation.
-    usable = usable or arcaneSurgeAvailableUntil > GetTime()
-    local cooldownRemaining = GetSpellCooldownRemaining("Arcane Surge")
+    -- Arcane Surge only in MageCore's rotation. GetSpellCooldown alone says
+    -- Arcane Surge is ready even before a resist enables it.
+    local usable = GetArcaneSurgeActionSlotState()
+        or S.arcaneSurgeAvailableUntil > GetTime()
+    if not usable then return nil end
+    local start, duration, enabled = GetSpellCooldownInfo("Arcane Surge")
+    if start == nil or enabled == 0 then return nil end
+    if requireCastableNow then
+        if start > 0 and duration > 0 and start + duration > GetTime() then
+            return nil
+        end
+    elseif IsOnRealCooldown(start, duration) then
+        return nil
+    end
     local manaCost = GetSpellManaCost("Arcane Surge")
-    if (not ignoreRotationConfiguration and not IsArcaneSurgeConfigured())
-        or not HasLivingEnemyTarget()
-        -- GetSpellCooldown alone says Arcane Surge is ready even before a
-        -- resist enables it.
-        or not usable
-        -- Never cancel Arcane Missiles while the global cooldown still blocks
-        -- the Surge cast.
-        or not cooldownRemaining
-        or cooldownRemaining > 0
-        or (manaCost and UnitMana("player") < manaCost)
+    if (manaCost and UnitMana("player") < manaCost)
         or not SpellCanReachTarget("Arcane Surge") then
         return nil
     end
@@ -1861,7 +2393,7 @@ local function TrackArcaneSurgeFromCombatMessage(message)
     for _, spellName in ipairs(ARCANE_SURGE_TRIGGER_SPELLS) do
         if string.find(
             lowerMessage, string.lower(spellName), 1, true) then
-            arcaneSurgeAvailableUntil = GetTime() + 4
+            S.arcaneSurgeAvailableUntil = GetTime() + 4
             return
         end
     end
@@ -1941,7 +2473,7 @@ end
 local function GetLowManaWandAction()
     if not HasLivingEnemyTarget() then return nil end
     if not AllConfiguredRotationSpellsNeedMana()
-        and GetTime() >= lowManaWandFallbackUntil then
+        and GetTime() >= S.lowManaWandFallbackUntil then
         return nil
     end
 
@@ -1965,18 +2497,10 @@ local function StartWandAttack()
     -- Prefer a native Shoot action because Vanilla clients handle the
     -- auto-repeat toggle most reliably through UseAction. Ignore macros that
     -- happen to share MageCore's current dynamic Shoot icon.
-    local wantedTexture = NormalizeTexture(
-        GetSpellTextureByName("Shoot"))
-    if wantedTexture then
-        local slot
-        for slot = 1, 120 do
-            local texture = GetActionTexture(slot)
-            if texture and not GetActionText(slot)
-                and NormalizeTexture(texture) == wantedTexture then
-                UseAction(slot)
-                return true
-            end
-        end
+    local slot = GetActionSlotsForTexture(GetSpellTextureByName("Shoot"))[1]
+    if slot then
+        UseAction(slot)
+        return true
     end
 
     CastSpellByName("Shoot")
@@ -1984,7 +2508,7 @@ local function StartWandAttack()
 end
 
 local function GetNextCombatSpell()
-    LoadDefaults()
+    EnsureConfig()
     local wandAction = GetLowManaWandAction()
     if wandAction then return wandAction end
     local arcaneSurge = GetArcaneSurgeAction()
@@ -2007,15 +2531,76 @@ local function GetNextCombatSpell()
     return nil
 end
 
+-- Vanilla has no facing API. When a spell fails with "Target needs to be in
+-- front of you", remember that for this target for a moment so the PvP burst
+-- does not waste Cone of Cold (which never reports that error itself).
+local function IsTargetBehindUs()
+    local blocked = S.facingBlocked
+    if not blocked then return false end
+    if blocked.target ~= GetTargetKey() or GetTime() >= blocked.expires then
+        S.facingBlocked = nil
+        return false
+    end
+    return true
+end
+
+-- PvP burst: with PvP Mode on and a living enemy targeted, fire Cone of Cold
+-- when the target is inside its (Arctic Reach adjusted) range, then Fire
+-- Blast, before the normal PvP Frostbolt logic. Arcane Surge already has a
+-- higher priority whenever its proc is up.
+local PVP_BURST_SPELLS = { "Cone of Cold", "Fire Blast" }
+
+local function GetPvpBurstSpell()
+    if not MageCore_Config.PvPMode or not MageCore_Config.PvPBurst
+        or not HasLivingEnemyTarget() or IsTargetBehindUs() then
+        return nil
+    end
+    local _, spellName
+    for _, spellName in ipairs(PVP_BURST_SPELLS) do
+        if GetSpellBookIndex(spellName) and IsSpellReady(spellName)
+            and HasEnoughManaForSpell(spellName)
+            and SpellCanReachTarget(spellName) then
+            return spellName
+        end
+    end
+    return nil
+end
+
+local RESLOW_SECONDS = 4
+
 local function GetPvpFrostboltSpell()
     local rankOne = "Frostbolt(Rank 1)"
-    if not MageCore_Config.PvPMode or not HasLivingEnemyTarget() or TargetHasFrostSlow() then return nil end
-    if pvpFrostboltUsedForTarget == GetTargetKey() then return nil end
-    if not GetSpellBookIndex(rankOne)
-        or not IsSpellReady(rankOne)
-        or not HasEnoughManaForSpell(rankOne)
-        or not SpellCanReachTarget(rankOne) then return nil end
-    return rankOne
+    if not MageCore_Config.PvPMode
+        or not HasLivingEnemyTarget() then return nil end
+    -- Don't use up the single Rank 1 attempt while the target is behind us.
+    if IsTargetBehindUs() then return nil end
+
+    local frostEffect = GetTargetPvpFrostEffect()
+    local spellName
+    if frostEffect == "FROZEN" then
+        -- A real freeze is a short damage window. Give the strongest learned
+        -- Frostbolt priority over the configured Fire rotation.
+        spellName = "Frostbolt"
+    elseif not frostEffect then
+        -- After the first Rank 1 on this target, "Re-slow" lets Rotation cast
+        -- it again once the chill has worn off (at most every 4 seconds, so
+        -- an immune or resisting target is not spammed).
+        if S.pvpFrostboltUsedForTarget == GetTargetKey()
+            and (not MageCore_Config.PvPReslow
+                or GetTime() - (S.lastRankOneFrostbolt or 0) < RESLOW_SECONDS) then
+            return nil
+        end
+        spellName = rankOne
+    else
+        -- An ordinary Frostbolt/Cone of Cold chill needs no PvP override.
+        return nil
+    end
+
+    if not GetSpellBookIndex(spellName)
+        or not IsSpellReady(spellName)
+        or not HasEnoughManaForSpell(spellName)
+        or not SpellCanReachTarget(spellName) then return nil end
+    return spellName
 end
 
 local function GetSoonestCooldownSpell()
@@ -2042,7 +2627,7 @@ local function GetOpenerSpell()
     if UnitAffectingCombat("player") or not HasLivingEnemyTarget() then return nil end
     local opener = MageCore_Config.Opener
     if not opener or opener == "None" then return nil end
-    if openerUsedForTarget == GetTargetKey() then return nil end
+    if S.openerUsedForTarget == GetTargetKey() then return nil end
     if opener == "Arcane Surge" then return GetArcaneSurgeAction() end
     if not IsSpellReady(opener)
         or not HasEnoughManaForSpell(opener)
@@ -2060,6 +2645,9 @@ local function CastGroupBuff(spellName, unit)
     local hadTarget = UnitExists("target")
     local targetWasUnit = hadTarget and UnitIsUnit("target", unit)
     if not targetWasUnit then
+        -- This temporary retarget (and the restore below) is not a real
+        -- target change; keep the per-target opener/PvP/range state.
+        S.suppressTargetResetUntil = GetTime() + 0.5
         TargetUnit(unit)
         -- Do not cast unless target acquisition actually succeeded. This is a
         -- final guard against auto-self-cast when a group member phases,
@@ -2069,7 +2657,7 @@ local function CastGroupBuff(spellName, unit)
             return false
         end
     end
-    lastGroupBuffAttempt = {
+    S.lastGroupBuffAttempt = {
         unit = unit,
         key = GetGroupUnitKey(unit),
         spell = spellName,
@@ -2083,98 +2671,136 @@ local function CastGroupBuff(spellName, unit)
     return true
 end
 
-local function GetBagItemCounts()
-    local counts = {}
+-- One pass over the bags, cached until the next BAG_UPDATE. Conjure,
+-- mana gem and food-status checks all read from this snapshot.
+local function GetBagSnapshot()
+    if S.bagSnapshot then return S.bagSnapshot end
+    local snapshot = { counts = {}, names = {}, positions = {}, free = 0 }
     local bag, slot
     for bag = 0, 4 do
         for slot = 1, GetContainerNumSlots(bag) do
             local link = GetContainerItemLink(bag, slot)
             if link then
                 local _, _, itemID = string.find(link, "item:(%d+)")
+                local _, _, itemName = string.find(link, "%[(.-)%]")
                 local _, count = GetContainerItemInfo(bag, slot)
-                if itemID then counts[itemID] = (counts[itemID] or 0) + (count or 1) end
+                if itemID then
+                    snapshot.counts[itemID] =
+                        (snapshot.counts[itemID] or 0) + (count or 1)
+                    snapshot.names[itemID] = itemName
+                end
+                if itemName then
+                    local key = string.lower(itemName)
+                    if not snapshot.positions[key] then
+                        snapshot.positions[key] = { bag, slot }
+                    end
+                end
+            else
+                snapshot.free = snapshot.free + 1
             end
         end
     end
-    return counts
+    S.bagSnapshot = snapshot
+    return snapshot
+end
+
+local function GetBagItemCounts()
+    local snapshot = GetBagSnapshot()
+    return snapshot.counts, snapshot.names
 end
 
 local function GetItemCountByID(itemID)
     if not itemID then return 0 end
-    return GetBagItemCounts()[tostring(itemID)] or 0
+    return GetBagSnapshot().counts[tostring(itemID)] or 0
 end
 
 local function FindBagItemByName(itemName)
-    local wanted = string.lower(itemName or "")
-    local bag, slot
-    for bag = 0, 4 do
-        for slot = 1, GetContainerNumSlots(bag) do
-            local link = GetContainerItemLink(bag, slot)
-            if link and string.find(string.lower(link), wanted, 1, true) then
-                return bag, slot
-            end
-        end
-    end
+    local position = GetBagSnapshot().positions[string.lower(itemName or "")]
+    if position then return position[1], position[2] end
     return nil, nil
 end
 
 local function HasFreeBagSlot()
-    local bag, slot
-    for bag = 0, 4 do
-        for slot = 1, GetContainerNumSlots(bag) do
-            if not GetContainerItemLink(bag, slot) then return true end
-        end
-    end
-    return false
+    return GetBagSnapshot().free > 0
 end
 
-local function ShowManaAgateWarning(message)
-    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r |cffff0000Mana Agate warning:|r " .. message)
-    if UIErrorsFrame then UIErrorsFrame:AddMessage("Mana Agate: " .. message, 1, 0.1, 0.1, 1) end
+local function ShowManaGemWarning(message)
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r |cffff0000Mana gem warning:|r " .. message)
+    if UIErrorsFrame then UIErrorsFrame:AddMessage("Mana gem: " .. message, 1, 0.1, 0.1, 1) end
 end
 
-local function GetManaAgateMaintenanceAction(showWarnings)
-    if not MageCore_Config.AutoConjureManaAgate or UnitAffectingCombat("player") then return nil end
-    if FindBagItemByName("Mana Agate") then
-        pendingManaAgate = nil
+-- Out of combat, conjure every learned mana gem that is missing from the
+-- bags (strongest first). Returns the conjure spell and its item, or "WAIT"
+-- while a recent conjure is still landing in the bags.
+-- Strongest first. Vanilla mages can carry one of each gem.
+local MANA_GEM_CONJURES = {
+    { item = "Mana Ruby", spell = "Conjure Mana Ruby" },
+    { item = "Mana Citrine", spell = "Conjure Mana Citrine" },
+    { item = "Mana Jade", spell = "Conjure Mana Jade" },
+    { item = "Mana Agate", spell = "Conjure Mana Agate" }
+}
+
+local function GetManaGemMaintenanceAction(showWarnings)
+    if not MageCore_Config.AutoManaGems or UnitAffectingCombat("player") then
         return nil
     end
-    if pendingManaAgate then
-        if GetTime() - pendingManaAgate <= 5 then return "WAIT" end
-        pendingManaAgate = nil
-    end
-    if not HasFreeBagSlot() then
-        if showWarnings and GetTime() - lastManaAgateBagWarning >= 10 then
-            ShowManaAgateWarning("Your bags are full.")
-            lastManaAgateBagWarning = GetTime()
+    local pending = S.pendingManaGem
+    if pending then
+        if FindBagItemByName(pending.item) then
+            S.pendingManaGem = nil
+        elseif GetTime() - pending.time <= 5 then
+            return "WAIT", pending.spell
+        else
+            S.pendingManaGem = nil
         end
-        return nil
     end
-    local spellName = "Conjure Mana Agate"
-    if not GetSpellBookIndex(spellName) or not IsSpellReady(spellName) then
-        if showWarnings and GetTime() - lastManaAgateSpellWarning >= 10 then
-            ShowManaAgateWarning("Conjure Mana Agate is not ready or was not found.")
-            lastManaAgateSpellWarning = GetTime()
+
+    local learnedAny = false
+    local _, gem
+    for _, gem in ipairs(MANA_GEM_CONJURES) do
+        if GetSpellBookIndex(gem.spell) then
+            learnedAny = true
+            if not FindBagItemByName(gem.item) then
+                if not HasFreeBagSlot() then
+                    if showWarnings
+                        and GetTime() - S.lastManaGemBagWarning >= 10 then
+                        ShowManaGemWarning("Your bags are full.")
+                        S.lastManaGemBagWarning = GetTime()
+                    end
+                    return nil
+                end
+                local manaCost = GetSpellManaCost(gem.spell)
+                if IsSpellReady(gem.spell)
+                    and (not manaCost or UnitMana("player") >= manaCost) then
+                    return gem.spell, gem.item
+                end
+            end
         end
-        return nil
     end
-    local manaCost = GetSpellManaCost(spellName)
-    if manaCost and UnitMana("player") < manaCost then return nil end
-    return spellName
+    if not learnedAny and showWarnings
+        and GetTime() - S.lastManaGemSpellWarning >= 10 then
+        ShowManaGemWarning("No Conjure Mana gem spell was found.")
+        S.lastManaGemSpellWarning = GetTime()
+    end
+    return nil
 end
 
 local function LearnPendingConjureItem()
-    if not pendingConjure then return end
-    if GetTime() - pendingConjure.started > 5 then
-        pendingConjure = nil
+    if not S.pendingConjure then return end
+    if GetTime() - S.pendingConjure.started > 5 then
+        S.pendingConjure = nil
         return
     end
-    local current = GetBagItemCounts()
+    local current, names = GetBagItemCounts()
     local itemID, count
     for itemID, count in pairs(current) do
-        if count > (pendingConjure.before[itemID] or 0) then
-            MageCore_Config[pendingConjure.kind .. "ItemID"] = itemID
-            pendingConjure = nil
+        -- Only conjured items qualify, so loot that arrives during the cast
+        -- cannot be learned as the water or food item by mistake.
+        local name = names[itemID] or ""
+        if count > (S.pendingConjure.before[itemID] or 0)
+            and string.find(name, "^Conjured") then
+            MageCore_Config[S.pendingConjure.kind .. "ItemID"] = itemID
+            S.pendingConjure = nil
             return
         end
     end
@@ -2182,9 +2808,9 @@ end
 
 local function GetNextConjureAction()
     if UnitAffectingCombat("player") then return nil end
-    if pendingConjure then
-        if GetTime() - pendingConjure.started <= 5 then return "WAIT" end
-        pendingConjure = nil
+    if S.pendingConjure then
+        if GetTime() - S.pendingConjure.started <= 5 then return "WAIT" end
+        S.pendingConjure = nil
     end
 
     local kinds = { "Water", "Food" }
@@ -2196,27 +2822,28 @@ local function GetNextConjureAction()
         if spellName and spellName ~= "None" and GetSpellBookIndex(spellName) and minimum > 0 then
             local itemID = MageCore_Config[kind .. "ItemID"]
             if not itemID then
-                conjureRestockActive[kind] = true
+                S.conjureRestockActive[kind] = true
                 return spellName, kind
             end
             local count = GetItemCountByID(itemID)
-            if count <= minimum then conjureRestockActive[kind] = true end
-            if conjureRestockActive[kind] then
+            if count <= minimum then S.conjureRestockActive[kind] = true end
+            if S.conjureRestockActive[kind] then
                 if count >= maximum then
-                    conjureRestockActive[kind] = nil
+                    S.conjureRestockActive[kind] = nil
                 else
                     return spellName, kind
                 end
             end
         else
-            conjureRestockActive[kind] = nil
+            S.conjureRestockActive[kind] = nil
         end
     end
     return nil
 end
 
 local function CastConjureSpell(spellName, kind)
-    pendingConjure = {
+    S.pendingConjure = {
+        spell = spellName,
         kind = kind,
         before = GetBagItemCounts(),
         started = GetTime()
@@ -2224,74 +2851,473 @@ local function CastConjureSpell(spellName, kind)
     CastSpellByName(spellName)
 end
 
-local function GetNextAction()
-    -- Observe the cast before resolving priority so an interrupted Fire spell
-    -- still teaches Smart mode that this enemy is a Fire threat.
-    local frostWard = GetFrostWardAction()
-    local fireWard = GetFireWardAction()
-    local ward = frostWard or fireWard
-    local counterspell = GetCounterspellAction()
-    if counterspell then return counterspell end
-    local arcaneSurge = GetArcaneSurgeAction()
-    if arcaneSurge then return arcaneSurge end
-    if ward then return ward end
-    local targetedSpell = GetNextTargetedMagicAction()
-    if targetedSpell then return targetedSpell end
-    local directPvp = ShouldGoDirectToPvpRotation()
-    if not directPvp then
-        local trackingSpell = GetFindMineralsAction()
-        if trackingSpell then return trackingSpell end
-        local manaAgateSpell = GetManaAgateMaintenanceAction(false)
-        if manaAgateSpell and manaAgateSpell ~= "WAIT" then return manaAgateSpell end
-        local conjureSpell = GetNextConjureAction()
-        if conjureSpell and conjureSpell ~= "WAIT" then return conjureSpell end
-        if ShouldAutoBuffFromRotation() then
-            local buff = GetNextBuffAction()
-            if buff then return buff end
+local function CastOnSelf(spellName)
+    if not spellName then return end
+    -- The second argument casts on the player without changing target, so
+    -- self-buffs and wards no longer fire PLAYER_TARGET_CHANGED and reset the
+    -- once-per-target opener and PvP Rank 1 Frostbolt state.
+    CastSpellByName(spellName, 1)
+    if SpellIsTargeting() then SpellTargetUnit("player") end
+end
+
+local function IsBagItemReady(bag, slot)
+    local _, _, locked = GetContainerItemInfo(bag, slot)
+    local start, duration, enabled = GetContainerItemCooldown(bag, slot)
+    return (not locked or locked == 0)
+        and (enabled == nil or enabled ~= 0)
+        and (not start or not duration
+            or start == 0 or duration == 0
+            or start + duration <= GetTime())
+end
+
+local function FindReadyManaGem()
+    local _, gem
+    for _, gem in ipairs(MANA_GEM_CONJURES) do
+        local bag, slot = FindBagItemByName(gem.item)
+        if bag and IsBagItemReady(bag, slot) then return bag, slot, gem.item end
+    end
+    return nil
+end
+
+local function FindUsableManaGem()
+    if not MageCore_Config.AutoManaGems then return nil end
+    local threshold = tonumber(MageCore_Config.ManaGemManaThreshold) or 500
+    if UnitMana("player") > threshold then return nil end
+    return FindReadyManaGem()
+end
+
+-- 1.12's GetItemInfo accepts an itemID or "item:1234" string, not a full
+-- link, and its fourth return value is the required level. That level is a
+-- good strength ranking for potions; the names are a fallback on the same scale.
+local HEALING_ITEM_NAME_LEVELS = {
+    { "major", 45 }, { "superior", 35 }, { "greater", 21 },
+    { "lesser", 3 }, { "minor", 1 }
+}
+
+local function GetHealingItemStrength(link, lowerName)
+    local _, _, itemString = string.find(link or "", "(item:%d+)")
+    if itemString and GetItemInfo then
+        local _, _, _, minLevel = GetItemInfo(itemString)
+        minLevel = tonumber(minLevel)
+        if minLevel and minLevel > 0 then return minLevel end
+    end
+    local _, entry
+    for _, entry in ipairs(HEALING_ITEM_NAME_LEVELS) do
+        if string.find(lowerName, entry[1], 1, true) then return entry[2] end
+    end
+    return 12
+end
+
+local function FindBestHealingPotion()
+    local thresholdPercent = tonumber(
+        MageCore_Config.HealingPotionHealthPercent) or 0
+    local maximumHealth = UnitHealthMax("player")
+    if thresholdPercent <= 0 or maximumHealth <= 0
+        or UnitHealth("player") * 100 > maximumHealth * thresholdPercent then
+        return nil
+    end
+
+    local inBattleground = IsInBattleground()
+    local bestBag, bestSlot, bestStrength
+    local bag, slot
+    for bag = 0, 4 do
+        for slot = 1, GetContainerNumSlots(bag) do
+            local link = GetContainerItemLink(bag, slot)
+            local _, _, itemName = string.find(link or "", "%[(.-)%]")
+            local lowerName = itemName and string.lower(itemName)
+            local isHealingPotion = lowerName and string.find(
+                lowerName, "healing potion", 1, true)
+            -- Battleground-only draughts cannot be used elsewhere.
+            local isHealingDraught = lowerName and inBattleground
+                and string.find(lowerName, "healing draught", 1, true)
+            if (isHealingPotion or isHealingDraught)
+                and IsBagItemReady(bag, slot) then
+                local strength = GetHealingItemStrength(link, lowerName)
+                if not bestBag or strength > bestStrength then
+                    bestBag, bestSlot, bestStrength = bag, slot, strength
+                end
+            end
         end
     end
-    -- With no enemy selected, preview the opener that Rotation will use after
-    -- acquiring a target instead of falling through to Rotation Slot 1.
-    if not UnitAffectingCombat("player") and not HasLivingEnemyTarget()
-        and MageCore_Config.Opener and MageCore_Config.Opener ~= "None"
-        and MageCore_Config.Opener ~= "Arcane Surge" then
-        return MageCore_Config.Opener
+    return bestBag, bestSlot
+end
+
+local function FindReadyDefilersTalisman()
+    if not MageCore_Config.AutoDefilersTalisman then return nil end
+    local maximumHealth = UnitHealthMax("player")
+    local healthLost = maximumHealth - UnitHealth("player")
+    local thresholdPercent = tonumber(
+        MageCore_Config.DefilersTalismanHealthLostPercent) or 20
+    if maximumHealth <= 0
+        or healthLost * 100 < maximumHealth * thresholdPercent then
+        return nil
     end
-    local pvpFrostbolt = GetPvpFrostboltSpell()
-    if pvpFrostbolt then return pvpFrostbolt end
-    local opener = GetOpenerSpell()
-    if opener then return opener end
-    local combatSpell = GetNextCombatSpell()
-    if combatSpell then return combatSpell end
-    local cooldownSpell = GetSoonestCooldownSpell()
-    if cooldownSpell then return cooldownSpell end
-    if MageCore_Config.Opener and MageCore_Config.Opener ~= "None"
-        and MageCore_Config.Opener ~= "Arcane Surge"
-        and GetSpellBookIndex(MageCore_Config.Opener) then
-        return MageCore_Config.Opener
+    local slot
+    for slot = 13, 14 do
+        local link = GetInventoryItemLink("player", slot)
+        if link and string.find(link, "Defiler's Talisman", 1, true) then
+            local start, duration, enabled =
+                GetInventoryItemCooldown("player", slot)
+            local ready = not start or not duration
+                or start == 0 or duration == 0
+                or start + duration <= GetTime()
+            if ready and (enabled == nil or enabled ~= 0) then return slot end
+        end
     end
-    local i
-    for i = 1, 6 do
-        local spellName = MageCore_Config["Rotation" .. i]
-        if spellName and spellName ~= "None"
-            and spellName ~= "Arcane Surge"
-            and GetSpellBookIndex(spellName) then
+    return nil
+end
+
+local function GetDefensiveShieldAction()
+    if not MageCore_Config.AutoDefensiveShield
+        or not UnitAffectingCombat("player") then return nil end
+    local maximumHealth = UnitHealthMax("player")
+    local percent = tonumber(MageCore_Config.DefensiveShieldHealthPercent) or 40
+    if maximumHealth <= 0
+        or UnitHealth("player") * 100 > maximumHealth * percent then
+        return nil
+    end
+    -- One absorb shield at a time; Ice Barrier is preferred when learned.
+    if PlayerHasBuff("Ice Barrier") or PlayerHasBuff("Mana Shield") then
+        return nil
+    end
+    local _, spellName
+    for _, spellName in ipairs({ "Ice Barrier", "Mana Shield" }) do
+        if GetSpellBookIndex(spellName) and IsSpellReady(spellName)
+            and HasEnoughManaForSpell(spellName) then
             return spellName
         end
     end
     return nil
 end
 
-local function CastOnSelf(spellName)
-    if not spellName then return end
-    local hadTarget = UnitExists("target")
-    local targetWasSelf = hadTarget and UnitIsUnit("target", "player")
-    if not targetWasSelf then TargetUnit("player") end
-    CastSpellByName(spellName)
-    if SpellIsTargeting() then SpellTargetUnit("player") end
-    if not targetWasSelf then
-        if hadTarget then TargetLastTarget() else ClearTarget() end
+local function GetEvocationAction()
+    if not MageCore_Config.AutoEvocation then return nil end
+    local maximumMana = UnitManaMax("player")
+    local percent = tonumber(MageCore_Config.EvocationManaPercent) or 10
+    if maximumMana <= 0
+        or UnitMana("player") * 100 > maximumMana * percent then
+        return nil
     end
+    if not GetSpellBookIndex("Evocation") or not IsSpellReady("Evocation") then
+        return nil
+    end
+    -- A ready mana gem is cheaper than an 8-second channel.
+    if MageCore_Config.AutoManaGems and FindReadyManaGem() then return nil end
+    return "Evocation"
+end
+
+-- ---------------------------------------------------------------------------
+-- Decisions. Every button press and every icon/tooltip/monitor preview goes
+-- through the same functions, so what the button shows is what it casts.
+-- An action is a small table:
+--   kind  = "SPELL", "SELF", "GROUP", "SHOOT", "POTION", "ITEM",
+--           "INVENTORY", "SURGE_INTERRUPT", "WAIT" or "PREVIEW"
+--   spell, unit, bag, slot, tag (SPELL detail), conjureKind
+-- ---------------------------------------------------------------------------
+local function SpellAction(spellName, tag)
+    return { kind = "SPELL", spell = spellName, tag = tag }
+end
+
+local function BuffAction(spellName, unit)
+    if unit == "player" then return { kind = "SELF", spell = spellName } end
+    return { kind = "GROUP", spell = spellName, unit = unit }
+end
+
+-- Shared by Rotation and the Arcane Explosion button: emergency healing,
+-- channel protection, mana gem and Defiler's Talisman, in that order.
+local function DecideEmergencyAndChannel(surgeIgnoresRotation)
+    local bag, slot = FindBestHealingPotion()
+    if bag then return { kind = "POTION", bag = bag, slot = slot } end
+
+    -- Protect Blizzard, Evocation and every other channel, but allow a Surge
+    -- proc that appears during Arcane Missiles to be consumed.
+    if S.channelInProgress then
+        local surge = S.channelSpellName == "Arcane Missiles"
+            and GetArcaneSurgeAction(surgeIgnoresRotation, true)
+        if surge then return { kind = "SURGE_INTERRUPT", spell = surge } end
+        return { kind = "WAIT", spell = S.channelSpellName }
+    end
+
+    bag, slot = FindUsableManaGem()
+    if bag then return { kind = "ITEM", bag = bag, slot = slot } end
+    local talismanSlot = FindReadyDefilersTalisman()
+    if talismanSlot then return { kind = "INVENTORY", slot = talismanSlot } end
+    return nil
+end
+
+-- Auto Target. In PvP Mode with "Players only" on, cycle through nearby
+-- enemies (like Tab) and stop at the first living player, skipping NPCs, pets
+-- and totems. If no enemy player is found, the target is cleared.
+local function AcquireEnemyTarget()
+    if not MageCore_Config.AutoTargetEnemy then return end
+    TargetNearestEnemy()
+    if not (MageCore_Config.PvPMode and MageCore_Config.PvPTargetPlayersOnly) then
+        return
+    end
+    local firstKey
+    local i
+    for i = 1, 12 do
+        if not UnitExists("target") then break end
+        if HasLivingEnemyTarget() and UnitIsPlayer("target") then return end
+        local _, guid = UnitExists("target")
+        local key = guid or GetTargetKey()
+        if not firstKey then
+            firstKey = key
+        elseif key == firstKey then
+            break -- cycled through every nearby enemy
+        end
+        TargetNearestEnemy()
+    end
+    if not (HasLivingEnemyTarget() and UnitIsPlayer("target")) then
+        ClearTarget()
+    end
+end
+
+local function DecideRotation(execute)
+    EnsureConfig()
+    local action = DecideEmergencyAndChannel(false)
+    if action then return action end
+
+    -- Evaluate both wards first: the Fire check also learns that this enemy
+    -- is a Fire threat even when Counterspell wins this press.
+    local frostWard = GetFrostWardAction()
+    local fireWard = GetFireWardAction()
+    local ward = frostWard or fireWard
+    local counterspell = GetCounterspellAction()
+    if counterspell then return SpellAction(counterspell, "COMBAT") end
+    local shield = GetDefensiveShieldAction()
+    if shield then return { kind = "SELF", spell = shield } end
+    local arcaneSurge = GetArcaneSurgeAction()
+    if arcaneSurge then return SpellAction(arcaneSurge, "SURGE") end
+    if ward then return { kind = "SELF", spell = ward } end
+
+    -- Amplify Magic belongs to the main rotation, in and out of combat.
+    local targetedSpell, targetedUnit = GetNextTargetedMagicAction()
+    if targetedSpell then return BuffAction(targetedSpell, targetedUnit) end
+
+    if not ShouldGoDirectToPvpRotation() then
+        local trackingSpell = GetFindMineralsAction()
+        if trackingSpell then return SpellAction(trackingSpell, "TRACKING") end
+
+        local gemSpell, gemItem = GetManaGemMaintenanceAction(execute)
+        if gemSpell == "WAIT" then return { kind = "WAIT", spell = gemItem } end
+        if gemSpell then
+            local gemAction = SpellAction(gemSpell, "CONJURE_GEM")
+            gemAction.item = gemItem
+            return gemAction
+        end
+
+        local conjureSpell, conjureKind = GetNextConjureAction()
+        if conjureSpell == "WAIT" then
+            return { kind = "WAIT",
+                spell = S.pendingConjure and S.pendingConjure.spell }
+        end
+        if conjureSpell then
+            local conjureAction = SpellAction(conjureSpell, "CONJURE")
+            conjureAction.conjureKind = conjureKind
+            return conjureAction
+        end
+
+        if ShouldAutoBuffFromRotation() then
+            local buff, unit = GetNextBuffAction()
+            if buff then return BuffAction(buff, unit) end
+        end
+    end
+
+    if not HasLivingEnemyTarget() then
+        if execute then
+            AcquireEnemyTarget()
+            if not HasLivingEnemyTarget() then return nil end
+        elseif not UnitAffectingCombat("player")
+            and MageCore_Config.Opener ~= "None"
+            and MageCore_Config.Opener ~= "Arcane Surge" then
+            -- With no enemy selected, preview the opener that Rotation will
+            -- use after acquiring a target instead of Rotation Slot 1.
+            return { kind = "PREVIEW", spell = MageCore_Config.Opener }
+        end
+    end
+
+    local pvpBurst = GetPvpBurstSpell()
+    if pvpBurst then return SpellAction(pvpBurst, "COMBAT") end
+    local pvpFrostbolt = GetPvpFrostboltSpell()
+    if pvpFrostbolt then return SpellAction(pvpFrostbolt, "PVP") end
+    local opener = GetOpenerSpell()
+    if opener then return SpellAction(opener, "OPENER") end
+    local evocation = GetEvocationAction()
+    if evocation then return SpellAction(evocation, "COMBAT") end
+    local combatSpell = GetNextCombatSpell()
+    if combatSpell == "Shoot" then return { kind = "SHOOT", spell = "Shoot" } end
+    if combatSpell then return SpellAction(combatSpell, "COMBAT") end
+    if execute then return nil end
+
+    -- Nothing is castable right now. Keep a meaningful icon: the spell that
+    -- comes off cooldown first, then the opener, then the first slot.
+    local preview = GetSoonestCooldownSpell()
+    if not preview and MageCore_Config.Opener ~= "None"
+        and MageCore_Config.Opener ~= "Arcane Surge"
+        and GetSpellBookIndex(MageCore_Config.Opener) then
+        preview = MageCore_Config.Opener
+    end
+    if not preview then
+        local i
+        for i = 1, 6 do
+            local spellName = MageCore_Config["Rotation" .. i]
+            if spellName and spellName ~= "None"
+                and spellName ~= "Arcane Surge"
+                and GetSpellBookIndex(spellName) then
+                preview = spellName
+                break
+            end
+        end
+    end
+    if preview then return { kind = "PREVIEW", spell = preview } end
+    return nil
+end
+
+local function DecideArcaneExplosion()
+    EnsureConfig()
+    local action = DecideEmergencyAndChannel(true)
+    if action then return action end
+    local spellName = GetArcaneExplosionButtonAction()
+    if spellName == "Arcane Surge" then return SpellAction(spellName, "SURGE") end
+    if spellName then return SpellAction(spellName, "COMBAT") end
+    return nil
+end
+
+local function GetDecisionTexture(action)
+    if not action then return nil end
+    if (action.kind == "POTION" or action.kind == "ITEM") and action.bag then
+        return (GetContainerItemInfo(action.bag, action.slot))
+    end
+    if action.kind == "INVENTORY" and GetInventoryItemTexture then
+        return GetInventoryItemTexture("player", action.slot)
+    end
+    return GetSpellTextureByName(action.spell)
+end
+
+local function RecordCombatAttempt(spellName, isOpener)
+    S.lastCombatSpellAttempt = {
+        spell = spellName,
+        target = GetTargetKey(),
+        time = GetTime(),
+        opener = isOpener
+    }
+end
+
+local function ExecuteAction(action)
+    if not action then return end
+    local kind = action.kind
+    if kind == "POTION" then
+        -- A potion cannot be used while casting. The player pressed a combat
+        -- button below the emergency threshold, so cancel the cast first.
+        if S.normalCastInProgress or S.channelInProgress then
+            SpellStopCasting()
+        end
+        UseContainerItem(action.bag, action.slot, 1)
+    elseif kind == "SURGE_INTERRUPT" then
+        SpellStopCasting()
+        S.arcaneSurgeAvailableUntil = 0
+        RecordCombatAttempt(action.spell)
+        CastSpellByName(action.spell)
+    elseif kind == "ITEM" then
+        UseContainerItem(action.bag, action.slot)
+    elseif kind == "INVENTORY" then
+        UseInventoryItem(action.slot)
+    elseif kind == "SELF" then
+        CastOnSelf(action.spell)
+    elseif kind == "GROUP" then
+        CastGroupBuff(action.spell, action.unit)
+    elseif kind == "SHOOT" then
+        -- Shoot is an auto-repeat toggle. Once the wand is firing, another
+        -- press must leave it active instead of toggling it off.
+        if IsConfiguredAutoRepeatActive("Shoot") then return end
+        RecordCombatAttempt("Shoot")
+        StartWandAttack()
+    elseif kind == "SPELL" then
+        local tag = action.tag
+        if tag == "TRACKING" then
+            CastSpellByName(action.spell)
+        elseif tag == "CONJURE_GEM" then
+            S.pendingManaGem = {
+                time = GetTime(), item = action.item, spell = action.spell
+            }
+            CastSpellByName(action.spell)
+        elseif tag == "CONJURE" then
+            CastConjureSpell(action.spell, action.conjureKind)
+        else
+            if tag == "SURGE" then S.arcaneSurgeAvailableUntil = 0 end
+            if tag == "OPENER" then S.openerUsedForTarget = GetTargetKey() end
+            if action.spell == "Frostbolt(Rank 1)" then
+                -- Consume the single Rank 1 attempt for this target now. It
+                -- becomes available again only after a real target change.
+                S.pvpFrostboltUsedForTarget = GetTargetKey()
+                S.lastRankOneFrostbolt = GetTime()
+                DEFAULT_CHAT_FRAME:AddMessage(
+                    "MageCore: Using Rank 1 Frostbolt", 1, 1, 0)
+            end
+            RecordCombatAttempt(action.spell, tag == "OPENER")
+            CastSpellByName(action.spell)
+        end
+    end
+    -- WAIT and PREVIEW intentionally do nothing.
+end
+
+-- Returns the spell (or item) the Rotation button would use now, plus the
+-- full decision for callers that need the item details or the texture.
+local function GetNextAction()
+    local action = DecideRotation(false)
+    return action and action.spell, action
+end
+
+function MageCore_Rotate()
+    ExecuteAction(DecideRotation(true))
+end
+
+function MageCore_ArcaneExplosion()
+    ExecuteAction(DecideArcaneExplosion())
+end
+
+-- Dedicated "R1 Frostbolt" button: always casts Rank 1 Frostbolt on the
+-- current target. It shares Rotation's bookkeeping, so Rotation will not
+-- immediately repeat it.
+function MageCore_SlowFrostbolt()
+    EnsureConfig()
+    local spellName = "Frostbolt(Rank 1)"
+    if not GetSpellBookIndex(spellName) then
+        UIErrorsFrame:AddMessage("Rank 1 Frostbolt is not in your spellbook.", 1, 0.1, 0.1, 1)
+        return
+    end
+    if not HasLivingEnemyTarget() then AcquireEnemyTarget() end
+    if not HasLivingEnemyTarget() then return end
+    S.pvpFrostboltUsedForTarget = GetTargetKey()
+    S.lastRankOneFrostbolt = GetTime()
+    RecordCombatAttempt(spellName)
+    CastSpellByName(spellName)
+end
+
+-- Kept as globals for macros written against earlier versions.
+function MageCore_TryHealingPotion()
+    EnsureConfig()
+    local bag, slot = FindBestHealingPotion()
+    if not bag then return false end
+    ExecuteAction({ kind = "POTION", bag = bag, slot = slot })
+    return true
+end
+
+function MageCore_TryManaAgate()
+    EnsureConfig()
+    local bag, slot = FindUsableManaGem()
+    if not bag then return false end
+    UseContainerItem(bag, slot)
+    return true
+end
+
+function MageCore_TryDefilersTalisman()
+    EnsureConfig()
+    local slot = FindReadyDefilersTalisman()
+    if not slot then return false end
+    UseInventoryItem(slot)
+    return true
 end
 
 function MageCore_Buff()
@@ -2328,319 +3354,17 @@ function MageCore_IceBlock()
     if buffIndex then
         -- If Ice Block was activated outside this button, begin a conservative
         -- one-second guard on the first attempted cancellation.
-        if not iceBlockGuardStartedAt then
-            iceBlockGuardStartedAt = now
+        if not S.iceBlockGuardStartedAt then
+            S.iceBlockGuardStartedAt = now
         end
-        if now - iceBlockGuardStartedAt < 1 then return end
+        if now - S.iceBlockGuardStartedAt < 1 then return end
         CancelPlayerBuff(buffIndex)
-        iceBlockGuardStartedAt = nil
+        S.iceBlockGuardStartedAt = nil
         return
     end
 
-    iceBlockGuardStartedAt = now
+    S.iceBlockGuardStartedAt = now
     CastSpellByName("Ice Block")
-end
-
-function MageCore_ArcaneExplosion()
-    LoadDefaults()
-
-    -- Preserve protected channels, but allow this button to consume a Surge
-    -- proc that appears during Arcane Missiles.
-    if channelInProgress then
-        local arcaneSurge = channelSpellName == "Arcane Missiles"
-            and GetArcaneSurgeAction(true)
-        if arcaneSurge then
-            SpellStopCasting()
-            arcaneSurgeAvailableUntil = 0
-            lastCombatSpellAttempt = {
-                spell = arcaneSurge,
-                target = GetTargetKey(),
-                time = GetTime()
-            }
-            CastSpellByName(arcaneSurge)
-        end
-        return
-    end
-
-    if MageCore_TryHealingPotion and MageCore_TryHealingPotion() then
-        return
-    end
-    if MageCore_TryManaAgate and MageCore_TryManaAgate() then
-        return
-    end
-    if MageCore_TryDefilersTalisman
-        and MageCore_TryDefilersTalisman() then
-        return
-    end
-
-    local spellName = GetArcaneExplosionButtonAction()
-    if not spellName then return end
-    if spellName == "Arcane Surge" then
-        arcaneSurgeAvailableUntil = 0
-    end
-    lastCombatSpellAttempt = {
-        spell = spellName,
-        target = GetTargetKey(),
-        time = GetTime()
-    }
-    CastSpellByName(spellName)
-end
-
-function MageCore_TryDefilersTalisman()
-    local maximumHealth = UnitHealthMax("player")
-    local healthLost = maximumHealth - UnitHealth("player")
-    local thresholdPercent = tonumber(
-        MageCore_Config
-            and MageCore_Config.DefilersTalismanHealthLostPercent) or 20
-    if not MageCore_Config
-        or not MageCore_Config.AutoDefilersTalisman
-        or maximumHealth <= 0
-        or healthLost * 100 < maximumHealth * thresholdPercent then
-        return false
-    end
-
-    local slot
-    for slot = 13, 14 do
-        local link = GetInventoryItemLink("player", slot)
-        if link and string.find(link, "Defiler's Talisman", 1, true) then
-            local start, duration, enabled =
-                GetInventoryItemCooldown("player", slot)
-            local ready = not start or not duration
-                or start == 0 or duration == 0
-                or start + duration <= GetTime()
-            if ready and (enabled == nil or enabled ~= 0) then
-                UseInventoryItem(slot)
-                return true
-            end
-        end
-    end
-    return false
-end
-
-function MageCore_TryManaAgate()
-    if not MageCore_Config
-        or not MageCore_Config.AutoConjureManaAgate
-        or UnitMana("player") > 200 then
-        return false
-    end
-
-    local bag, slot = FindBagItemByName("Mana Agate")
-    if not bag then return false end
-
-    local start, duration = GetContainerItemCooldown(bag, slot)
-    local ready = not start or not duration
-        or start == 0 or duration == 0
-        or start + duration <= GetTime()
-    if not ready then return false end
-
-    UseContainerItem(bag, slot)
-    return true
-end
-
-function MageCore_TryHealingPotion()
-    local thresholdPercent = tonumber(
-        MageCore_Config
-            and MageCore_Config.HealingPotionHealthLostPercent) or 0
-    local maximumHealth = UnitHealthMax("player")
-    local currentHealth = UnitHealth("player")
-    if thresholdPercent <= 0
-        or maximumHealth <= 0
-        or currentHealth * 100 > maximumHealth * thresholdPercent then
-        return false
-    end
-
-    local bestBag
-    local bestSlot
-    local bestItemLevel = -1
-    local inBattleground = false
-    if IsInInstance then
-        local _, instanceType = IsInInstance()
-        inBattleground = instanceType == "pvp"
-    end
-    if not inBattleground and GetBattlefieldStatus then
-        local queueIndex
-        for queueIndex = 1, 3 do
-            if GetBattlefieldStatus(queueIndex) == "active" then
-                inBattleground = true
-                break
-            end
-        end
-    end
-
-    local bag, slot
-    for bag = 0, 4 do
-        for slot = 1, GetContainerNumSlots(bag) do
-            local link = GetContainerItemLink(bag, slot)
-            local _, _, itemName = string.find(link or "", "%[(.-)%]")
-            local lowerName = itemName and string.lower(itemName)
-            local isHealingPotion = lowerName and string.find(
-                lowerName, "healing potion", 1, true)
-            local isHealingDraught = lowerName and string.find(
-                lowerName, "healing draught", 1, true)
-            if isHealingPotion or (isHealingDraught and inBattleground) then
-                local start, duration =
-                    GetContainerItemCooldown(bag, slot)
-                local ready = not start or not duration
-                    or start == 0 or duration == 0
-                    or start + duration <= GetTime()
-                if ready then
-                    local itemLevel = 0
-                    if GetItemInfo then
-                        local _, _, _, foundItemLevel = GetItemInfo(link)
-                        itemLevel = tonumber(foundItemLevel) or 0
-                    end
-                    if not bestBag or itemLevel > bestItemLevel then
-                        bestBag = bag
-                        bestSlot = slot
-                        bestItemLevel = itemLevel
-                    end
-                end
-            end
-        end
-    end
-
-    if bestBag then
-        UseContainerItem(bestBag, bestSlot)
-        return true
-    end
-    return false
-end
-
-function MageCore_Rotate()
-    LoadDefaults()
-    -- A short Arcane Surge proc may appear during an Arcane Missiles tick.
-    -- Let a Rotation press consume it immediately, while continuing to protect
-    -- Blizzard, Evocation, and every other channel from accidental cancellation.
-    if channelInProgress then
-        local arcaneSurge = channelSpellName == "Arcane Missiles"
-            and GetArcaneSurgeAction()
-        if arcaneSurge then
-            SpellStopCasting()
-            arcaneSurgeAvailableUntil = 0
-            lastCombatSpellAttempt = {
-                spell = arcaneSurge,
-                target = GetTargetKey(),
-                time = GetTime()
-            }
-            CastSpellByName(arcaneSurge)
-        end
-        return
-    end
-    if MageCore_TryHealingPotion() then return end
-    if MageCore_TryManaAgate() then return end
-    if MageCore_TryDefilersTalisman() then return end
-    -- Learn the enemy's Fire threat even when Counterspell wins this press.
-    local frostWard = GetFrostWardAction()
-    local fireWard = GetFireWardAction()
-    local ward = frostWard or fireWard
-    local counterspell = GetCounterspellAction()
-    if counterspell then
-        lastCombatSpellAttempt = {
-            spell = counterspell,
-            target = GetTargetKey(),
-            time = GetTime()
-        }
-        CastSpellByName(counterspell)
-        return
-    end
-    local arcaneSurge = GetArcaneSurgeAction()
-    if arcaneSurge then
-        arcaneSurgeAvailableUntil = 0
-        lastCombatSpellAttempt = {
-            spell = arcaneSurge,
-            target = GetTargetKey(),
-            time = GetTime()
-        }
-        CastSpellByName(arcaneSurge)
-        return
-    end
-    if ward then
-        CastOnSelf(ward)
-        return
-    end
-    -- Amplify Magic maintenance belongs to the main rotation. It is allowed
-    -- in combat and does not depend on the separate Auto Buff OOC toggle.
-    local targetedSpell, targetedUnit = GetNextTargetedMagicAction()
-    if targetedSpell then
-        if targetedUnit == "player" then
-            CastOnSelf(targetedSpell)
-        else
-            CastGroupBuff(targetedSpell, targetedUnit)
-        end
-        return
-    end
-    local directPvp = ShouldGoDirectToPvpRotation()
-    if not directPvp then
-        local trackingSpell = GetFindMineralsAction()
-        if trackingSpell then
-            CastSpellByName(trackingSpell)
-            return
-        end
-
-        local manaAgateSpell = GetManaAgateMaintenanceAction(true)
-        if manaAgateSpell == "WAIT" then return end
-        if manaAgateSpell then
-            pendingManaAgate = GetTime()
-            CastSpellByName(manaAgateSpell)
-            return
-        end
-
-        local conjureSpell, conjureKind = GetNextConjureAction()
-        if conjureSpell == "WAIT" then return end
-        if conjureSpell then
-            CastConjureSpell(conjureSpell, conjureKind)
-            return
-        end
-
-        if ShouldAutoBuffFromRotation() then
-            local buff, unit = GetNextBuffAction()
-            if buff then
-                if unit == "player" then
-                    CastOnSelf(buff)
-                else
-                    CastGroupBuff(buff, unit)
-                end
-                return
-            end
-        end
-    end
-
-    if not HasLivingEnemyTarget() then TargetNearestEnemy() end
-    if not HasLivingEnemyTarget() then return end
-
-    local spellName = GetPvpFrostboltSpell()
-    local isOpener = false
-    if not spellName then
-        spellName = GetOpenerSpell()
-        isOpener = spellName ~= nil
-    end
-    if not spellName then spellName = GetNextCombatSpell() end
-    if spellName then
-        -- Shoot is an auto-repeat toggle. Once the wand is firing, another
-        -- Rotation press must leave it active instead of toggling it off.
-        if spellName == "Shoot"
-            and IsConfiguredAutoRepeatActive("Shoot") then
-            return
-        end
-        if isOpener then openerUsedForTarget = GetTargetKey() end
-        if spellName == "Frostbolt(Rank 1)" then
-            pvpFrostboltUsedForTarget = GetTargetKey()
-        end
-        lastCombatSpellAttempt = {
-            spell = spellName,
-            target = GetTargetKey(),
-            time = GetTime(),
-            opener = isOpener
-        }
-        if spellName == "Frostbolt(Rank 1)" then
-            DEFAULT_CHAT_FRAME:AddMessage("MageCore: Using Rank 1 Frostbolt", 1, 1, 0)
-        end
-        if spellName == "Shoot" then
-            StartWandAttack()
-        else
-            CastSpellByName(spellName)
-        end
-    end
 end
 
 local function GetMacroIndex(name, characterOnly)
@@ -2673,6 +3397,7 @@ end
 
 local function GetActionButtons()
     if AllActionButtons then return AllActionButtons end
+    if S.actionButtons then return S.actionButtons end
     local buttons = {}
     local prefixes = {
         "ActionButton", "MultiBarBottomLeftButton", "MultiBarBottomRightButton",
@@ -2686,14 +3411,42 @@ local function GetActionButtons()
             if button then table.insert(buttons, button) end
         end
     end
+    if table.getn(buttons) > 0 then S.actionButtons = buttons end
     return buttons
 end
 
+-- Find the placed MageRot/MageAoE/MageIceBlock buttons once per frame instead
+-- of walking every action button separately for icon, cooldown and mana.
+local EMPTY_LIST = {}
+local function GetMacroButtons(macroName)
+    local now = GetTime()
+    if not S.macroButtons or S.macroButtonsTime ~= now then
+        local map = {}
+        local _, button
+        for _, button in ipairs(GetActionButtons()) do
+            local actionSlot = ActionButton_GetPagedID(button)
+            local text = actionSlot and GetActionText(actionSlot)
+            if text == "MageRot" or text == "MageAoE"
+                or text == "MageIceBlock" then
+                map[text] = map[text] or {}
+                table.insert(map[text], button)
+            end
+        end
+        S.macroButtons = map
+        S.macroButtonsTime = now
+    end
+    return S.macroButtons[macroName] or EMPTY_LIST
+end
+
 local function ShowRotationButtonTooltip(button)
-    local spellName = GetNextAction()
+    local spellName, action = GetNextAction()
     local spellIndex = spellName and GetSpellBookIndex(spellName)
     GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
-    if spellIndex then
+    if action and (action.kind == "POTION" or action.kind == "ITEM") then
+        GameTooltip:SetBagItem(action.bag, action.slot)
+    elseif action and action.kind == "INVENTORY" then
+        GameTooltip:SetInventoryItem("player", action.slot)
+    elseif spellIndex then
         GameTooltip:SetSpell(spellIndex, BOOKTYPE_SPELL)
     else
         GameTooltip:AddLine("MageCore Rotation")
@@ -2754,12 +3507,24 @@ local function UpdateRotationCooldown(spellName)
     end
 
     local _, button
-    for _, button in ipairs(GetActionButtons()) do
-        local actionSlot = ActionButton_GetPagedID(button)
-        if actionSlot and GetActionText(actionSlot) == "MageRot" then
-            local cooldown = GetActionButtonCooldown(button)
-            if cooldown then CooldownFrame_SetTimer(cooldown, start, duration, enabled) end
-        end
+    for _, button in ipairs(GetMacroButtons("MageRot")) do
+        local cooldown = GetActionButtonCooldown(button)
+        if cooldown then CooldownFrame_SetTimer(cooldown, start, duration, enabled) end
+    end
+end
+
+local function SetRotationIconTexture(texture)
+    if S.rotationIconTexture then
+        S.rotationIconTexture:SetTexture(texture)
+    end
+
+    -- Editing a macro's icon does not reliably redraw an action button on
+    -- every Vanilla client/UI replacement, so update placed MageRot buttons
+    -- directly as well.
+    local _, button
+    for _, button in ipairs(GetMacroButtons("MageRot")) do
+        local icon = getglobal(button:GetName() .. "Icon")
+        if icon then icon:SetTexture(texture) end
     end
 end
 
@@ -2769,15 +3534,11 @@ local function UpdateIceBlockCooldown()
     if start == nil then start, duration, enabled = 0, 0, 0 end
 
     local _, button
-    for _, button in ipairs(GetActionButtons()) do
-        local actionSlot = ActionButton_GetPagedID(button)
-        if actionSlot
-            and GetActionText(actionSlot) == "MageIceBlock" then
-            local cooldown = GetActionButtonCooldown(button)
-            if cooldown then
-                CooldownFrame_SetTimer(
-                    cooldown, start, duration, enabled)
-            end
+    for _, button in ipairs(GetMacroButtons("MageIceBlock")) do
+        local cooldown = GetActionButtonCooldown(button)
+        if cooldown then
+            CooldownFrame_SetTimer(
+                cooldown, start, duration, enabled)
         end
     end
 end
@@ -2790,13 +3551,10 @@ local function UpdateArcaneExplosionCooldown(spellName)
     end
 
     local _, button
-    for _, button in ipairs(GetActionButtons()) do
-        local actionSlot = ActionButton_GetPagedID(button)
-        if actionSlot and GetActionText(actionSlot) == "MageAoE" then
-            local cooldown = GetActionButtonCooldown(button)
-            if cooldown then
-                CooldownFrame_SetTimer(cooldown, start, duration, enabled)
-            end
+    for _, button in ipairs(GetMacroButtons("MageAoE")) do
+        local cooldown = GetActionButtonCooldown(button)
+        if cooldown then
+            CooldownFrame_SetTimer(cooldown, start, duration, enabled)
         end
     end
 end
@@ -2814,14 +3572,11 @@ local function UpdateRotationManaState(spellName)
         red, green, blue = 0.4, 0.4, 0.4
     end
 
-    if rotationIconTexture then rotationIconTexture:SetVertexColor(red, green, blue) end
+    if S.rotationIconTexture then S.rotationIconTexture:SetVertexColor(red, green, blue) end
     local _, button
-    for _, button in ipairs(GetActionButtons()) do
-        local actionSlot = ActionButton_GetPagedID(button)
-        if actionSlot and GetActionText(actionSlot) == "MageRot" then
-            local icon = getglobal(button:GetName() .. "Icon")
-            if icon then icon:SetVertexColor(red, green, blue) end
-        end
+    for _, button in ipairs(GetMacroButtons("MageRot")) do
+        local icon = getglobal(button:GetName() .. "Icon")
+        if icon then icon:SetVertexColor(red, green, blue) end
     end
 end
 
@@ -2831,16 +3586,13 @@ local function UpdateArcaneExplosionManaState(spellName)
     local red, green, blue = 1, 1, 1
     if insufficient then red, green, blue = 0.4, 0.4, 0.4 end
 
-    if arcaneExplosionIconTexture then
-        arcaneExplosionIconTexture:SetVertexColor(red, green, blue)
+    if S.arcaneExplosionIconTexture then
+        S.arcaneExplosionIconTexture:SetVertexColor(red, green, blue)
     end
     local _, button
-    for _, button in ipairs(GetActionButtons()) do
-        local actionSlot = ActionButton_GetPagedID(button)
-        if actionSlot and GetActionText(actionSlot) == "MageAoE" then
-            local icon = getglobal(button:GetName() .. "Icon")
-            if icon then icon:SetVertexColor(red, green, blue) end
-        end
+    for _, button in ipairs(GetMacroButtons("MageAoE")) do
+        local icon = getglobal(button:GetName() .. "Icon")
+        if icon then icon:SetVertexColor(red, green, blue) end
     end
 end
 
@@ -2850,19 +3602,19 @@ function MageCore_UpdateArcaneExplosionButton()
     local spellName = GetArcaneExplosionButtonAction()
     local texture = GetSpellTextureByName(spellName)
         or ICON_PATH .. "Spell_Nature_WispSplode"
-    if arcaneExplosionIconTexture then
-        arcaneExplosionIconTexture:SetTexture(texture)
+    if S.arcaneExplosionIconTexture then
+        S.arcaneExplosionIconTexture:SetTexture(texture)
     end
 
     local macroIcon = TextureName(texture) or "Spell_Nature_WispSplode"
-    if macroIcon ~= lastArcaneExplosionIcon then
+    if macroIcon ~= S.lastArcaneExplosionIcon then
         local index = GetMacroIndex("MageAoE", false)
         if index > 0 then
             EditMacro(
                 index, "MageAoE", macroIcon,
                 "/script MageCore_ArcaneExplosion()", nil, nil)
         end
-        lastArcaneExplosionIcon = macroIcon
+        S.lastArcaneExplosionIcon = macroIcon
     end
     UpdateArcaneExplosionCooldown(spellName)
     UpdateArcaneExplosionManaState(spellName)
@@ -2888,11 +3640,11 @@ function MageCore_CreateArcaneExplosionDragButton(rotationPanel)
     dragArcaneExplosion:SetHeight(48)
     dragArcaneExplosion:SetPoint("TOPLEFT", 160, -272)
     StyleButton(dragArcaneExplosion)
-    arcaneExplosionIconTexture =
+    S.arcaneExplosionIconTexture =
         dragArcaneExplosion:CreateTexture(nil, "OVERLAY")
-    arcaneExplosionIconTexture:SetPoint("TOPLEFT", 4, -4)
-    arcaneExplosionIconTexture:SetPoint("BOTTOMRIGHT", -4, 4)
-    arcaneExplosionIconTexture:SetTexture(
+    S.arcaneExplosionIconTexture:SetPoint("TOPLEFT", 4, -4)
+    S.arcaneExplosionIconTexture:SetPoint("BOTTOMRIGHT", -4, 4)
+    S.arcaneExplosionIconTexture:SetTexture(
         GetSpellTextureByName(GetArcaneExplosionButtonAction())
             or ICON_PATH .. "Spell_Nature_WispSplode")
     dragArcaneExplosion:RegisterForDrag("LeftButton")
@@ -2923,131 +3675,648 @@ function MageCore_CreateArcaneExplosionDragButton(rotationPanel)
     arcaneExplosionLabel:SetText("Arcane Explosion")
 end
 
--- Kept outside MageCore_CreateMenu to avoid increasing that function's
--- upvalue count on Vanilla Lua.
-function MageCore_CreateDefilersTalismanButton(consumablePanel)
-    local button = CreateFrame("Button", nil, consumablePanel)
-    button:SetWidth(190)
-    button:SetHeight(32)
-    button:SetPoint("TOPLEFT", 18, -160)
-    StyleButton(button)
+-- Menu builders live in one table to stay under Vanilla Lua's limit of 200
+-- locals in the main chunk.
+local UI = {}
 
-    local label = button:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    label:SetPoint("CENTER", 0, 0)
-    local function UpdateText()
-        label:SetText(
-            "Defiler's Talisman: "
-                .. (MageCore_Config.AutoDefilersTalisman
-                    and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateText()
+-- ---------------------------------------------------------------------------
+-- Shared placement for movable bars. Positions are stored as the bar's centre
+-- in UIParent units, so changing a bar's scale keeps it where it was.
+-- ---------------------------------------------------------------------------
+local BARS = {}
 
-    button:SetScript("OnClick", function()
-        MageCore_Config.AutoDefilersTalisman =
-            not MageCore_Config.AutoDefilersTalisman
-        UpdateText()
-    end)
-    button:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Defiler's Talisman")
-        GameTooltip:AddLine(
-            "Rotation uses the equipped trinket after you have lost the selected percentage of your maximum health.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine(
-            "It must be equipped in either trinket slot and off cooldown.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    button:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    local slider = CreateFrame(
-        "Slider", "MageCoreDefilersHealthSlider",
-        consumablePanel, "OptionsSliderTemplate")
-    slider:SetWidth(250)
-    slider:SetHeight(16)
-    slider:SetPoint("TOPLEFT", 28, -225)
-    slider:SetMinMaxValues(5, 95)
-    slider:SetValueStep(5)
-
-    local sliderText = getglobal("MageCoreDefilersHealthSliderText")
-    local sliderLow = getglobal("MageCoreDefilersHealthSliderLow")
-    local sliderHigh = getglobal("MageCoreDefilersHealthSliderHigh")
-    if sliderLow then sliderLow:SetText("5%") end
-    if sliderHigh then sliderHigh:SetText("95%") end
-    local function UpdateSliderText(value)
-        if sliderText then
-            sliderText:SetText(
-                "Use after " .. value .. "% health lost")
-        end
-    end
-    slider:SetScript("OnValueChanged", function()
-        local value = math.floor(this:GetValue() + 0.5)
-        MageCore_Config.DefilersTalismanHealthLostPercent = value
-        UpdateSliderText(value)
-    end)
-    local savedPercent = tonumber(
-        MageCore_Config.DefilersTalismanHealthLostPercent) or 20
-    savedPercent = math.max(5, math.min(95, savedPercent))
-    MageCore_Config.DefilersTalismanHealthLostPercent = savedPercent
-    slider:SetValue(savedPercent)
-    UpdateSliderText(savedPercent)
-
-    local potionSlider = CreateFrame(
-        "Slider", "MageCoreHealingPotionSlider",
-        consumablePanel, "OptionsSliderTemplate")
-    potionSlider:SetWidth(250)
-    potionSlider:SetHeight(16)
-    potionSlider:SetPoint("TOPLEFT", 28, -305)
-    potionSlider:SetMinMaxValues(0, 60)
-    potionSlider:SetValueStep(5)
-
-    local potionText = getglobal("MageCoreHealingPotionSliderText")
-    local potionLow = getglobal("MageCoreHealingPotionSliderLow")
-    local potionHigh = getglobal("MageCoreHealingPotionSliderHigh")
-    if potionLow then potionLow:SetText("Off") end
-    if potionHigh then potionHigh:SetText("60%") end
-    local function UpdatePotionText(value)
-        if not potionText then return end
-        if value <= 0 then
-            potionText:SetText("Healing potion/draught: OFF")
-        else
-            potionText:SetText(
-                "Use at " .. value .. "% health")
-        end
-    end
-    potionSlider:SetScript("OnValueChanged", function()
-        local value = math.floor(this:GetValue() + 0.5)
-        MageCore_Config.HealingPotionHealthLostPercent = value
-        UpdatePotionText(value)
-    end)
-    potionSlider:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Healing Potion / Draught")
-        GameTooltip:AddLine(
-            "Rotation uses the strongest ready Healing Potion or Healing Draught in your bags at or below the selected health percentage.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine(
-            "Battleground-only draughts are used only inside an active battleground.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine(
-            "Set the slider to Off to disable automatic potion use.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    potionSlider:SetScript(
-        "OnLeave", function() GameTooltip:Hide() end)
-    local savedPotionPercent = tonumber(
-        MageCore_Config.HealingPotionHealthLostPercent) or 0
-    savedPotionPercent =
-        math.max(0, math.min(60, savedPotionPercent))
-    MageCore_Config.HealingPotionHealthLostPercent = savedPotionPercent
-    potionSlider:SetValue(savedPotionPercent)
-    UpdatePotionText(savedPotionPercent)
+function BARS.Scale(prefix)
+    local percent = tonumber(MageCore_Config[prefix .. "Scale"]) or 100
+    return math.max(50, math.min(200, percent)) / 100
 end
 
--- Kept outside MageCore_CreateMenu because Vanilla Lua limits each function
--- to 32 captured outer locals.
+function BARS.Apply(frame, prefix, defaultY)
+    if not frame then return end
+    local scale = BARS.Scale(prefix)
+    frame:SetScale(scale)
+    local relative = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    if relative <= 0 then relative = 1 end
+    frame:ClearAllPoints()
+    frame:SetPoint("CENTER", UIParent, "CENTER",
+        (MageCore_Config[prefix .. "X"] or 0) / relative,
+        (MageCore_Config[prefix .. "Y"] or defaultY) / relative)
+end
+
+function BARS.Save(frame, prefix)
+    local x, y = frame:GetCenter()
+    local parentX, parentY = UIParent:GetCenter()
+    if not (x and y and parentX and parentY) then return end
+    local relative = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    MageCore_Config[prefix .. "X"] = x * relative - parentX
+    MageCore_Config[prefix .. "Y"] = y * relative - parentY
+end
+
+function BARS.MakeMovable(frame, prefix, lockKey)
+    frame:SetMovable(true)
+    frame:SetClampedToScreen(true)
+    frame:EnableMouse(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", function()
+        if not MageCore_Config[lockKey] then this:StartMoving() end
+    end)
+    frame:SetScript("OnDragStop", function()
+        this:StopMovingOrSizing()
+        BARS.Save(this, prefix)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Player cast bar. Gold while casting, green while channeling, a short
+-- flash on success and red on interrupt. While unlocked it stays visible as
+-- a preview so it can be dragged into place.
+-- ---------------------------------------------------------------------------
+local CB = {}
+local CAST_BAR_EVENTS = {
+    "SPELLCAST_START", "SPELLCAST_STOP", "SPELLCAST_FAILED",
+    "SPELLCAST_INTERRUPTED", "SPELLCAST_DELAYED",
+    "SPELLCAST_CHANNEL_START", "SPELLCAST_CHANNEL_UPDATE",
+    "SPELLCAST_CHANNEL_STOP"
+}
+
+-- The default bar is switched off while MageCore's bar is enabled and given
+-- back its events when it is disabled again.
+function CB.SetBlizzardBarEnabled(enabled)
+    if not CastingBarFrame then return end
+    local _, eventName
+    if enabled then
+        if not S.blizzardCastBarDisabled then return end
+        for _, eventName in ipairs(CAST_BAR_EVENTS) do
+            CastingBarFrame:RegisterEvent(eventName)
+        end
+        S.blizzardCastBarDisabled = nil
+    else
+        for _, eventName in ipairs(CAST_BAR_EVENTS) do
+            CastingBarFrame:UnregisterEvent(eventName)
+        end
+        CastingBarFrame:Hide()
+        S.blizzardCastBarDisabled = true
+    end
+end
+
+function CB.ShowState()
+    local frame = S.castBarFrame
+    local cast = S.castState
+    if cast then
+        frame:SetAlpha(1)
+        frame:Show()
+        return
+    end
+    if not MageCore_Config.CastBarLocked then
+        -- Unlocked preview for positioning.
+        frame.bar:SetMinMaxValues(0, 1)
+        frame.bar:SetValue(0.6)
+        frame.bar:SetStatusBarColor(1, 0.7, 0)
+        frame.icon:SetTexture(ICON_PATH .. DEFAULT_ICON)
+        frame.name:SetText("MageCore cast bar - drag to move")
+        frame.time:SetText("")
+        frame.spark:Hide()
+        frame:SetAlpha(1)
+        frame:Show()
+    else
+        frame:Hide()
+    end
+end
+
+function CB.Start(spellName, seconds, channel)
+    local frame = S.castBarFrame
+    if not frame or not MageCore_Config.CastBarShown then return end
+    local now = GetTime()
+    S.castState = {
+        name = spellName or "",
+        startTime = now,
+        endTime = now + math.max(0.1, seconds or 0),
+        channel = channel
+    }
+    frame.bar:SetMinMaxValues(0, math.max(0.1, seconds or 0))
+    frame.bar:SetStatusBarColor(channel and 0.2 or 1, channel and 0.9 or 0.7,
+        channel and 0.3 or 0)
+    frame.icon:SetTexture(GetSpellTextureByName(spellName)
+        or ICON_PATH .. "INV_Misc_QuestionMark")
+    frame.name:SetText(spellName or "")
+    frame.spark:Show()
+    CB.ShowState()
+end
+
+function CB.Finish(success, label)
+    local frame = S.castBarFrame
+    local cast = S.castState
+    if not frame or not cast or cast.fading then return end
+    cast.fading = GetTime()
+    frame.spark:Hide()
+    if success then
+        local _, maximum = frame.bar:GetMinMaxValues()
+        frame.bar:SetValue(cast.channel and 0 or maximum)
+        if not cast.channel then frame.bar:SetStatusBarColor(0.2, 1, 0.2) end
+        frame.time:SetText("")
+    else
+        frame.bar:SetStatusBarColor(1, 0.15, 0.15)
+        frame.name:SetText(label or "Interrupted")
+        frame.time:SetText("")
+    end
+end
+
+function CB.OnUpdate()
+    local frame = S.castBarFrame
+    local cast = S.castState
+    if not cast then return end
+    local now = GetTime()
+    if cast.fading then
+        local alpha = 1 - (now - cast.fading) / 0.5
+        if alpha <= 0 then
+            S.castState = nil
+            CB.ShowState()
+        else
+            frame:SetAlpha(alpha)
+        end
+        return
+    end
+    local duration = cast.endTime - cast.startTime
+    local value
+    if cast.channel then
+        value = math.max(0, cast.endTime - now)
+    else
+        value = math.min(duration, now - cast.startTime)
+    end
+    frame.bar:SetValue(value)
+    frame.time:SetText(string.format("%.1f", math.max(0, cast.endTime - now)))
+    local width = frame.bar:GetWidth() or 0
+    if duration > 0 then
+        frame.spark:SetPoint("CENTER", frame.bar, "LEFT",
+            width * value / duration, 0)
+    end
+    -- Safety net in case a stop event is missed.
+    if now > cast.endTime + 0.5 then CB.Finish(true) end
+end
+
+function CB.OnEvent()
+    if not MageCore_Config or not MageCore_Config.CastBarShown then return end
+    local cast = S.castState
+    if event == "SPELLCAST_START" then
+        CB.Start(arg1, (tonumber(arg2) or 0) / 1000, false)
+    elseif event == "SPELLCAST_CHANNEL_START" then
+        CB.Start(arg2 or (cast and cast.name), (tonumber(arg1) or 0) / 1000, true)
+    elseif event == "SPELLCAST_DELAYED" then
+        if cast and not cast.channel and not cast.fading then
+            local delay = (tonumber(arg1) or 0) / 1000
+            cast.startTime = cast.startTime + delay
+            cast.endTime = cast.endTime + delay
+        end
+    elseif event == "SPELLCAST_CHANNEL_UPDATE" then
+        if cast and cast.channel and not cast.fading then
+            local remaining = (tonumber(arg1) or 0) / 1000
+            if remaining <= 0 then
+                CB.Finish(true)
+            else
+                cast.endTime = GetTime() + remaining
+            end
+        end
+    elseif event == "SPELLCAST_STOP" then
+        -- A stop during a channel belongs to the channel's own start.
+        if cast and not cast.channel then CB.Finish(true) end
+    elseif event == "SPELLCAST_CHANNEL_STOP" then
+        if cast and cast.channel then CB.Finish(true) end
+    elseif event == "SPELLCAST_INTERRUPTED" then
+        if cast then CB.Finish(false, "Interrupted") end
+    elseif event == "SPELLCAST_FAILED" then
+        if cast then CB.Finish(false, "Failed") end
+    end
+end
+
+function CB.Create()
+    if S.castBarFrame then return end
+    local frame = CreateFrame("Frame", "MageCoreCastBar", UIParent)
+    S.castBarFrame = frame
+    frame:SetWidth(240)
+    frame:SetHeight(20)
+    frame:SetFrameStrata("HIGH")
+    frame:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        tile = false, edgeSize = 1,
+        insets = { left = 0, right = 0, top = 0, bottom = 0 }
+    })
+    frame:SetBackdropColor(0, 0, 0, 0.6)
+    frame:SetBackdropBorderColor(0, 0, 0, 1)
+    BARS.MakeMovable(frame, "CastBar", "CastBarLocked")
+
+    frame.icon = frame:CreateTexture(nil, "ARTWORK")
+    frame.icon:SetWidth(20)
+    frame.icon:SetHeight(20)
+    frame.icon:SetPoint("RIGHT", frame, "LEFT", -2, 0)
+    frame.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+    frame.bar = CreateFrame("StatusBar", nil, frame)
+    frame.bar:SetPoint("TOPLEFT", 1, -1)
+    frame.bar:SetPoint("BOTTOMRIGHT", -1, 1)
+    frame.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+
+    local overlay = CreateFrame("Frame", nil, frame)
+    overlay:SetAllPoints(frame)
+    overlay:SetFrameLevel(frame.bar:GetFrameLevel() + 1)
+    frame.spark = overlay:CreateTexture(nil, "OVERLAY")
+    frame.spark:SetTexture("Interface\\CastingBar\\UI-CastingBar-Spark")
+    frame.spark:SetBlendMode("ADD")
+    frame.spark:SetWidth(20)
+    frame.spark:SetHeight(36)
+    frame.name = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.name:SetPoint("LEFT", 5, 0)
+    frame.time = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.time:SetPoint("RIGHT", -5, 0)
+
+    local _, eventName
+    for _, eventName in ipairs(CAST_BAR_EVENTS) do
+        frame:RegisterEvent(eventName)
+    end
+    frame:SetScript("OnEvent", CB.OnEvent)
+    frame:SetScript("OnUpdate", CB.OnUpdate)
+    frame:Hide()
+end
+
+function CB.ApplyConfig()
+    if not MageCore_Config.CastBarShown then
+        S.castState = nil
+        if S.castBarFrame then S.castBarFrame:Hide() end
+        CB.SetBlizzardBarEnabled(true)
+        return
+    end
+    CB.Create()
+    CB.SetBlizzardBarEnabled(false)
+    BARS.Apply(S.castBarFrame, "CastBar", -150)
+    CB.ShowState()
+end
+
+function CB.Command(argument)
+    EnsureConfig()
+    local message
+    if argument == "" then
+        MageCore_Config.CastBarShown = not MageCore_Config.CastBarShown
+    elseif argument == "on" then
+        MageCore_Config.CastBarShown = true
+    elseif argument == "off" then
+        MageCore_Config.CastBarShown = false
+    elseif argument == "lock" then
+        MageCore_Config.CastBarLocked = true
+        message = "Cast bar locked."
+    elseif argument == "unlock" then
+        MageCore_Config.CastBarLocked = false
+        message = "Cast bar unlocked. Drag it to move it."
+    elseif argument == "reset" then
+        MageCore_Config.CastBarX = 0
+        MageCore_Config.CastBarY = -150
+        MageCore_Config.CastBarScale = 100
+        message = "Cast bar position and size reset."
+    else
+        message = "Use |cffffffff/mc cast on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
+    end
+    CB.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    message = message or ("Cast bar " .. (MageCore_Config.CastBarShown
+        and "|cff00ff00shown|r" or "|cffff4444hidden|r") .. ".")
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+-- ---------------------------------------------------------------------------
+-- Movable XP bar. Purple while rested XP is available, blue otherwise; the
+-- lighter overlay shows how far the rested bonus reaches. Hidden at max level.
+-- ---------------------------------------------------------------------------
+local XP = {}
+local XP_BAR_WIDTH = 400
+local XP_BAR_HEIGHT = 14
+
+function XP.IsMaxLevel()
+    local maximum = UnitXPMax("player") or 0
+    return maximum <= 0 or (UnitLevel("player") or 0) >= 60
+end
+
+function XP.Update()
+    local frame = S.xpBarFrame
+    if not frame or not frame:IsShown() then return end
+    local current = UnitXP("player") or 0
+    local maximum = UnitXPMax("player") or 0
+    if maximum <= 0 then maximum = 1 end
+    local rested = GetXPExhaustion() or 0
+    frame.bar:SetMinMaxValues(0, maximum)
+    frame.bar:SetValue(current)
+    frame.rested:SetMinMaxValues(0, maximum)
+    frame.rested:SetValue(math.min(maximum, current + rested))
+    if rested > 0 then
+        frame.bar:SetStatusBarColor(0.58, 0.0, 0.55)
+        frame.rested:SetStatusBarColor(0.25, 0.25, 1.0, 0.6)
+    else
+        frame.bar:SetStatusBarColor(0.0, 0.39, 0.88)
+        frame.rested:SetStatusBarColor(0, 0, 0, 0)
+    end
+    local text = "Level " .. (UnitLevel("player") or 0) .. "   "
+        .. current .. " / " .. maximum
+        .. " (" .. math.floor(100 * current / maximum) .. "%)"
+    if rested > 0 then
+        text = text .. "   Rested " .. math.floor(100 * rested / maximum) .. "%"
+    end
+    frame.text:SetText(text)
+end
+
+function XP.SavePosition()
+    BARS.Save(S.xpBarFrame, "XPBar")
+end
+
+function XP.ApplyPosition()
+    BARS.Apply(S.xpBarFrame, "XPBar", -200)
+end
+
+function XP.Create()
+    if S.xpBarFrame then return end
+    local frame = CreateFrame("Frame", "MageCoreXPBar", UIParent)
+    S.xpBarFrame = frame
+    frame:SetWidth(XP_BAR_WIDTH)
+    frame:SetHeight(XP_BAR_HEIGHT)
+    frame:SetFrameStrata("MEDIUM")
+    frame:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        tile = false, edgeSize = 1,
+        insets = { left = 0, right = 0, top = 0, bottom = 0 }
+    })
+    frame:SetBackdropColor(0, 0, 0, 0.6)
+    frame:SetBackdropBorderColor(0, 0, 0, 1)
+    frame:SetMovable(true)
+    frame:SetClampedToScreen(true)
+    frame:EnableMouse(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", function()
+        if not MageCore_Config.XPBarLocked then this:StartMoving() end
+    end)
+    frame:SetScript("OnDragStop", function()
+        this:StopMovingOrSizing()
+        XP.SavePosition()
+    end)
+
+    frame.rested = CreateFrame("StatusBar", nil, frame)
+    frame.rested:SetPoint("TOPLEFT", 1, -1)
+    frame.rested:SetPoint("BOTTOMRIGHT", -1, 1)
+    frame.rested:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+
+    frame.bar = CreateFrame("StatusBar", nil, frame)
+    frame.bar:SetPoint("TOPLEFT", 1, -1)
+    frame.bar:SetPoint("BOTTOMRIGHT", -1, 1)
+    frame.bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    frame.bar:SetFrameLevel(frame.rested:GetFrameLevel() + 1)
+
+    -- The text sits on its own frame above both bars.
+    local overlay = CreateFrame("Frame", nil, frame)
+    overlay:SetAllPoints(frame)
+    overlay:SetFrameLevel(frame.bar:GetFrameLevel() + 1)
+    frame.text = overlay:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.text:SetPoint("CENTER", 0, 0)
+
+    frame:SetScript("OnEnter", function()
+        local current = UnitXP("player") or 0
+        local maximum = UnitXPMax("player") or 0
+        local rested = GetXPExhaustion() or 0
+        GameTooltip:SetOwner(this, "ANCHOR_TOP")
+        GameTooltip:AddLine(ACCENT .. "Experience|r")
+        GameTooltip:AddLine("Current: " .. current .. " / " .. maximum, 1, 1, 1)
+        GameTooltip:AddLine("To level: " .. math.max(0, maximum - current), 1, 1, 1)
+        GameTooltip:AddLine("Rested: " .. rested, 0.5, 0.5, 1)
+        GameTooltip:AddLine(MageCore_Config.XPBarLocked
+            and "Locked (/mc xp unlock)" or "Drag to move (/mc xp lock)",
+            0.8, 0.8, 0.8)
+        GameTooltip:Show()
+    end)
+    frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    frame:RegisterEvent("PLAYER_XP_UPDATE")
+    frame:RegisterEvent("UPDATE_EXHAUSTION")
+    frame:RegisterEvent("PLAYER_LEVEL_UP")
+    frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    frame:SetScript("OnEvent", function()
+        if event == "PLAYER_LEVEL_UP" and (tonumber(arg1) or 0) >= 60 then
+            -- UnitLevel can still report the old level during this event.
+            this:Hide()
+        elseif event == "PLAYER_LEVEL_UP" or event == "PLAYER_ENTERING_WORLD" then
+            XP.ApplyConfig()
+        else
+            XP.Update()
+        end
+    end)
+    XP.ApplyPosition()
+    frame:Hide()
+end
+
+-- Show or hide the bar to match the saved settings.
+function XP.ApplyConfig()
+    if not MageCore_Config.XPBarShown then
+        if S.xpBarFrame then S.xpBarFrame:Hide() end
+        return
+    end
+    XP.Create()
+    XP.ApplyPosition()
+    if XP.IsMaxLevel() then
+        S.xpBarFrame:Hide()
+    else
+        S.xpBarFrame:Show()
+        XP.Update()
+    end
+end
+
+function XP.Command(argument)
+    EnsureConfig()
+    local message
+    if argument == "" then
+        MageCore_Config.XPBarShown = not MageCore_Config.XPBarShown
+    elseif argument == "on" then
+        MageCore_Config.XPBarShown = true
+    elseif argument == "off" then
+        MageCore_Config.XPBarShown = false
+    elseif argument == "lock" then
+        MageCore_Config.XPBarLocked = true
+        message = "XP bar locked."
+    elseif argument == "unlock" then
+        MageCore_Config.XPBarLocked = false
+        message = "XP bar unlocked. Drag it to move it."
+    elseif argument == "reset" then
+        MageCore_Config.XPBarX = 0
+        MageCore_Config.XPBarY = -200
+        MageCore_Config.XPBarScale = 100
+        message = "XP bar position and size reset."
+    else
+        message = "Use |cffffffff/mc xp on|r, |cffffffffoff|r, |cfffffffflock|r, |cffffffffunlock|r or |cffffffffreset|r."
+    end
+    XP.ApplyConfig()
+    if UI.RefreshMenuControls then UI.RefreshMenuControls() end
+    if not message then
+        message = "XP bar " .. (MageCore_Config.XPBarShown
+            and "|cff00ff00shown|r" or "|cffff4444hidden|r") .. "."
+        if MageCore_Config.XPBarShown and XP.IsMaxLevel() then
+            message = message .. " It stays hidden at max level."
+        end
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+
+-- Every control registers a refresher, so /mc reset and profile loads can
+-- update an already-open window without a /reload.
+function UI.RefreshMenuControls()
+    local _, refresh
+    for _, refresh in ipairs(S.menuRefreshers) do refresh() end
+end
+
+function UI.AddSimpleTooltip(frame, title, text)
+    if not title then return end
+    frame:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine(title)
+        if text then GameTooltip:AddLine(text, 0.8, 0.8, 0.8, 1, true) end
+        GameTooltip:Show()
+    end)
+    frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
+function UI.MakeToggleButton(parent, width, x, y, label, key,
+                                tooltipTitle, tooltipText, onChange)
+    local button = CreateFrame("Button", nil, parent)
+    button:SetWidth(width)
+    button:SetHeight(32)
+    button:SetPoint("TOPLEFT", x, y)
+    StyleButton(button)
+    local text = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("CENTER", 0, 0)
+    local function Refresh()
+        text:SetText(label .. ": " .. (MageCore_Config[key]
+            and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
+    end
+    Refresh()
+    table.insert(S.menuRefreshers, Refresh)
+    button:SetScript("OnClick", function()
+        MageCore_Config[key] = not MageCore_Config[key]
+        Refresh()
+        if onChange then onChange() end
+    end)
+    UI.AddSimpleTooltip(button, tooltipTitle, tooltipText)
+    return button
+end
+
+function UI.MakeCheckBox(parent, name, x, y, label, key,
+                            onChange, tooltipTitle, tooltipText)
+    local check = CreateFrame("CheckButton", name, parent, "UICheckButtonTemplate")
+    check:SetWidth(24)
+    check:SetHeight(24)
+    check:SetPoint("TOPLEFT", x, y)
+    local function Refresh()
+        check:SetChecked(MageCore_Config[key] and 1 or nil)
+    end
+    Refresh()
+    table.insert(S.menuRefreshers, Refresh)
+    check:SetScript("OnClick", function()
+        MageCore_Config[key] = this:GetChecked() and true or false
+        if onChange then onChange() end
+    end)
+    UI.AddSimpleTooltip(check, tooltipTitle, tooltipText)
+    local text = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("LEFT", check, "RIGHT", 4, 0)
+    text:SetText(ACCENT .. label .. "|r")
+    return check
+end
+
+function UI.MakeNumberBox(parent, name, x, y, width, label, key,
+                             minimum, maximum, default, onSave)
+    local text = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("TOPLEFT", x, y)
+    text:SetText(ACCENT .. label .. "|r")
+    local box = CreateFrame("EditBox", name, parent)
+    box:SetWidth(width)
+    box:SetHeight(28)
+    box:SetPoint("TOPLEFT", x, y - 17)
+    box:SetNumeric(true)
+    box:SetMaxLetters(string.len(tostring(maximum)))
+    box:SetAutoFocus(false)
+    box:SetFontObject("GameFontHighlightSmall")
+    box:SetTextInsets(8, 8, 0, 0)
+    StyleButton(box)
+    local function Refresh()
+        box:SetText(tonumber(MageCore_Config[key]) or default)
+    end
+    local function Save()
+        local value = tonumber(box:GetText()) or default
+        value = math.max(minimum, math.min(maximum, math.floor(value)))
+        MageCore_Config[key] = value
+        if onSave then onSave(value) end
+        Refresh()
+    end
+    Refresh()
+    table.insert(S.menuRefreshers, Refresh)
+    box:SetScript("OnEnterPressed", function() Save(); this:ClearFocus() end)
+    box:SetScript("OnEditFocusLost", Save)
+    box:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+    return box
+end
+
+function UI.MakeSlider(parent, name, x, y, minimum, maximum, step,
+                          key, default, lowText, highText, FormatText)
+    local slider = CreateFrame("Slider", name, parent, "OptionsSliderTemplate")
+    slider:SetWidth(250)
+    slider:SetHeight(16)
+    slider:SetPoint("TOPLEFT", x, y)
+    slider:SetMinMaxValues(minimum, maximum)
+    slider:SetValueStep(step)
+    local label = getglobal(name .. "Text")
+    local low = getglobal(name .. "Low")
+    local high = getglobal(name .. "High")
+    if low then low:SetText(lowText) end
+    if high then high:SetText(highText) end
+    slider:SetScript("OnValueChanged", function()
+        local value = math.floor(this:GetValue() + 0.5)
+        MageCore_Config[key] = value
+        if label then label:SetText(FormatText(value)) end
+    end)
+    local function Refresh()
+        local value = tonumber(MageCore_Config[key]) or default
+        value = math.max(minimum, math.min(maximum, value))
+        MageCore_Config[key] = value
+        slider:SetValue(value)
+        if label then label:SetText(FormatText(value)) end
+    end
+    Refresh()
+    table.insert(S.menuRefreshers, Refresh)
+    return slider
+end
+
+-- Kept outside MageCore_CreateMenu so each builder stays well below Vanilla
+-- Lua's 32-upvalue limit.
+function MageCore_CreateManaGemControls(consumablePanel)
+    UI.MakeToggleButton(consumablePanel, 190, 18, -105, "Mana Gems",
+        "AutoManaGems", "Mana Gems",
+        "Out of combat, Rotation conjures every learned mana gem that is missing (Ruby, Citrine, Jade, Agate). Both combat buttons use the strongest ready gem at or below the configured mana value.",
+        function() S.pendingManaGem = nil end)
+    UI.MakeNumberBox(consumablePanel, "MageCoreManaGemManaThreshold",
+        230, -99, 75, "Use at mana:", "ManaGemManaThreshold", 0, 9999, 500)
+end
+
+function MageCore_CreateDefilersTalismanButton(consumablePanel)
+    UI.MakeToggleButton(consumablePanel, 190, 18, -160, "Defiler's Talisman",
+        "AutoDefilersTalisman", "Defiler's Talisman",
+        "Rotation uses the equipped trinket after you have lost the selected percentage of your maximum health. It must be equipped in either trinket slot and off cooldown.")
+
+    UI.MakeSlider(consumablePanel, "MageCoreDefilersHealthSlider", 28, -225,
+        5, 95, 5, "DefilersTalismanHealthLostPercent", 20, "5%", "95%",
+        function(value) return "Use after " .. value .. "% health lost" end)
+
+    local potionSlider = UI.MakeSlider(consumablePanel,
+        "MageCoreHealingPotionSlider", 28, -305, 0, 60, 5,
+        "HealingPotionHealthPercent", 0, "Off", "60%",
+        function(value)
+            if value <= 0 then return "Healing potion/draught: OFF" end
+            return "Rotation press: use at " .. value .. "% health"
+        end)
+    UI.AddSimpleTooltip(potionSlider, "Healing Potion / Draught",
+        "A Rotation or Arcane Explosion button press uses the strongest ready Healing Potion or Healing Draught in your bags at or below the selected health percentage. Battleground-only draughts are used only inside an active battleground. Set the slider to Off to disable automatic potion use.")
+end
+
 function MageCore_CreateSpellDrop(parent, label, key, x, y, listKind)
     local labelText = parent:CreateFontString(
         nil, "OVERLAY", "GameFontNormalSmall")
@@ -3059,11 +4328,11 @@ function MageCore_CreateSpellDrop(parent, label, key, x, y, listKind)
     dropdown:SetPoint("TOPLEFT", x, y - 15)
     UIDropDownMenu_SetWidth(145, dropdown)
     UIDropDownMenu_Initialize(dropdown, function()
-        local list = spellBookSpells
+        local list = S.spellBookSpells
         if listKind == "armor" then
-            list = armorSpellBookSpells
+            list = S.armorSpellBookSpells
         elseif listKind == "buff" then
-            list = regularBuffSpellBookSpells
+            list = S.regularBuffSpellBookSpells
         end
         local _, value
         for _, value in ipairs(list) do
@@ -3080,9 +4349,13 @@ function MageCore_CreateSpellDrop(parent, label, key, x, y, listKind)
         end
     end)
 
-    local current = MageCore_Config[key] or "None"
-    UIDropDownMenu_SetSelectedValue(dropdown, current)
-    UIDropDownMenu_SetText(current, dropdown)
+    local function Refresh()
+        local current = MageCore_Config[key] or "None"
+        UIDropDownMenu_SetSelectedValue(dropdown, current)
+        UIDropDownMenu_SetText(current, dropdown)
+    end
+    Refresh()
+    table.insert(S.menuRefreshers, Refresh)
 end
 
 local function FormatRotationBoxCooldown(seconds)
@@ -3124,7 +4397,7 @@ local function GetRotationBoxSpellState(spellName, isNext)
     elseif spellName == "Arcane Surge" then
         local actionUsable = GetArcaneSurgeActionSlotState()
         local procActive = actionUsable
-            or arcaneSurgeAvailableUntil > GetTime()
+            or S.arcaneSurgeAvailableUntil > GetTime()
         if not procActive then
             state, red, green, blue = "NO RESIST PROC", 0.75, 0.45, 1
         end
@@ -3164,13 +4437,18 @@ local function GetRotationBoxSpellState(spellName, isNext)
 end
 
 local function UpdateRotationBox()
-    if not rotationBoxFrame or not rotationBoxFrame:IsShown()
+    if not S.rotationBoxFrame or not S.rotationBoxFrame:IsShown()
         or not MageCore_Config then return end
 
-    local nextSpell = GetNextCombatSpell()
+    -- Mark the slot the Rotation button will actually cast next, using the
+    -- same decision as the action-bar icon.
+    local decision = S.lastDecision
+    local nextSpell = decision
+        and (decision.kind == "SPELL" or decision.kind == "SHOOT")
+        and decision.spell
     local i
     for i = 1, 6 do
-        local row = rotationBoxRows[i]
+        local row = S.rotationBoxRows[i]
         local spellName = MageCore_Config["Rotation" .. i] or "None"
         row.spellName = spellName ~= "None" and spellName or nil
         row.name:SetText(i)
@@ -3218,12 +4496,12 @@ local function UpdateRotationBox()
 end
 
 local function CreateRotationBox()
-    if rotationBoxFrame then return end
-    LoadDefaults()
+    if S.rotationBoxFrame then return end
+    EnsureConfig()
 
     local frame = CreateFrame(
         "Frame", "MageCoreRotationBox", UIParent)
-    rotationBoxFrame = frame
+    S.rotationBoxFrame = frame
     frame:SetWidth(330)
     frame:SetHeight(103)
     frame:SetPoint(
@@ -3341,21 +4619,21 @@ local function CreateRotationBox()
             GameTooltip:Show()
         end)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        rotationBoxRows[i] = row
+        S.rotationBoxRows[i] = row
     end
 
     frame:Hide()
 end
 
 local function SetRotationBoxShown(shown)
-    LoadDefaults()
+    EnsureConfig()
     MageCore_Config.RotationBoxShown = shown and true or false
     if shown then
         CreateRotationBox()
-        rotationBoxFrame:Show()
+        S.rotationBoxFrame:Show()
         UpdateRotationBox()
-    elseif rotationBoxFrame then
-        rotationBoxFrame:Hide()
+    elseif S.rotationBoxFrame then
+        S.rotationBoxFrame:Hide()
     end
     DEFAULT_CHAT_FRAME:AddMessage(
         ACCENT .. "[MageCore]|r Rotation monitor "
@@ -3373,15 +4651,15 @@ local function PrintSpellBookDebug()
     local rotationNames = ""
     local buffNames = ""
     local i
-    for i = 2, table.getn(spellBookSpells) do
-        rotationNames = rotationNames .. (rotationNames == "" and "" or ", ") .. spellBookSpells[i]
+    for i = 2, table.getn(S.spellBookSpells) do
+        rotationNames = rotationNames .. (rotationNames == "" and "" or ", ") .. S.spellBookSpells[i]
     end
-    for i = 2, table.getn(helpfulSpellBookSpells) do
-        buffNames = buffNames .. (buffNames == "" and "" or ", ") .. helpfulSpellBookSpells[i]
+    for i = 2, table.getn(S.helpfulSpellBookSpells) do
+        buffNames = buffNames .. (buffNames == "" and "" or ", ") .. S.helpfulSpellBookSpells[i]
     end
     DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "MageCore spellbook debug:|r")
-    DEFAULT_CHAT_FRAME:AddMessage("Rotation (" .. (table.getn(spellBookSpells) - 1) .. "): " .. (rotationNames ~= "" and rotationNames or "NONE FOUND"))
-    DEFAULT_CHAT_FRAME:AddMessage("Buffs (" .. (table.getn(helpfulSpellBookSpells) - 1) .. "): " .. (buffNames ~= "" and buffNames or "NONE FOUND"))
+    DEFAULT_CHAT_FRAME:AddMessage("Rotation (" .. (table.getn(S.spellBookSpells) - 1) .. "): " .. (rotationNames ~= "" and rotationNames or "NONE FOUND"))
+    DEFAULT_CHAT_FRAME:AddMessage("Buffs (" .. (table.getn(S.helpfulSpellBookSpells) - 1) .. "): " .. (buffNames ~= "" and buffNames or "NONE FOUND"))
     if GetSpellBookIndex("Arcane Surge") then
         local index = GetSpellBookIndex("Arcane Surge")
         local usable, noMana
@@ -3397,7 +4675,7 @@ local function PrintSpellBookDebug()
                 .. ", action usable="
                 .. (actionUsable and "yes" or "no")
                 .. ", resist tracked="
-                .. (arcaneSurgeAvailableUntil > GetTime()
+                .. (S.arcaneSurgeAvailableUntil > GetTime()
                     and "yes" or "no")
                 .. ", no mana=" .. (noMana and "yes" or "no")
                 .. ", selected="
@@ -3406,7 +4684,7 @@ local function PrintSpellBookDebug()
 end
 
 local function PrintAmplifyDebug()
-    LoadDefaults()
+    EnsureConfig()
     local units = GetTargetedGroupBuffUnits()
     local resolved = {}
     local _, unit
@@ -3436,7 +4714,7 @@ local function PrintAmplifyDebug()
 end
 
 local function TestAmplifyCast()
-    LoadDefaults()
+    EnsureConfig()
     if not GetSpellBookIndex("Amplify Magic") then
         DEFAULT_CHAT_FRAME:AddMessage(
             ACCENT .. "[MageCore]|r Amplify Magic was not found in the spellbook.")
@@ -3455,23 +4733,155 @@ local function TestAmplifyCast()
     CastGroupBuff("Amplify Magic", unit)
 end
 
+local function Chat(message)
+    DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r " .. message)
+end
+
+-- Profiles store the rotation, buffs and combat behavior, but not window
+-- positions, nameplate looks or consumable thresholds.
+local function GetProfileKeys()
+    local keys = {
+        "Opener", "AutoBuff", "PvPMode", "AutoCounterspell",
+        "CounterspellHealingOnly", "AutoFireWard", "FireWardMode",
+        "TargetedMagicMode", "TargetedMagicValue", "TargetedMagicSavedName",
+        "AutoTargetEnemy", "AutoArcaneSurge", "PvPBurst", "PvPReslow",
+        "PvPTargetPlayersOnly",
+        "AutoEvocation", "EvocationManaPercent",
+        "AutoDefensiveShield", "DefensiveShieldHealthPercent"
+    }
+    local i
+    for i = 1, 6 do
+        table.insert(keys, "Rotation" .. i)
+        table.insert(keys, "Buff" .. i)
+        if i > 1 then table.insert(keys, "Buff" .. i .. "Group") end
+    end
+    return keys
+end
+
+local function FindProfileName(name)
+    local wanted = string.lower(name or "")
+    local existing
+    for existing in pairs(MageCore_Config.Profiles) do
+        if string.lower(existing) == wanted then return existing end
+    end
+    return nil
+end
+
+local function AfterSettingsChanged()
+    LoadDefaults()
+    RefreshSpellBook()
+    S.groupBlockedUnits = {}
+    S.conjureRestockActive = {}
+    S.pendingConjure = nil
+    S.pendingManaGem = nil
+    S.openerUsedForTarget = nil
+    UI.RefreshMenuControls()
+    NP.ApplyNameplateVisibility()
+    XP.ApplyConfig()
+    CB.ApplyConfig()
+end
+
+local function ProfileCommand(subcommand, name)
+    EnsureConfig()
+    if subcommand == "list" or subcommand == "" then
+        Chat("Profiles: " .. UI.GetProfileNamesText())
+        return
+    end
+    if name == "" then
+        Chat("Usage: |cffffffff/mc profile save/load/delete <name>|r or |cffffffff/mc profile list|r")
+        return
+    end
+    local existing = FindProfileName(name)
+    if subcommand == "save" then
+        local profile = {}
+        local _, key
+        for _, key in ipairs(GetProfileKeys()) do
+            profile[key] = MageCore_Config[key]
+        end
+        MageCore_Config.Profiles[existing or name] = profile
+        UI.RefreshMenuControls()
+        Chat("Profile saved: |cffffffff" .. (existing or name) .. "|r")
+    elseif subcommand == "load" then
+        if not existing then
+            Chat("No profile named |cffffffff" .. name .. "|r.")
+            return
+        end
+        local profile = MageCore_Config.Profiles[existing]
+        local _, key
+        for _, key in ipairs(GetProfileKeys()) do
+            MageCore_Config[key] = profile[key]
+        end
+        AfterSettingsChanged()
+        Chat("Profile loaded: |cffffffff" .. existing .. "|r")
+    elseif subcommand == "delete" then
+        if not existing then
+            Chat("No profile named |cffffffff" .. name .. "|r.")
+            return
+        end
+        MageCore_Config.Profiles[existing] = nil
+        UI.RefreshMenuControls()
+        Chat("Profile deleted: |cffffffff" .. existing .. "|r")
+    else
+        Chat("Usage: |cffffffff/mc profile save/load/delete <name>|r or |cffffffff/mc profile list|r")
+    end
+end
+
+local function ResetSettings()
+    EnsureConfig()
+    -- Keep saved profiles and the minimap icon position.
+    MageCore_Config = {
+        Profiles = MageCore_Config.Profiles,
+        MinimapPos = MageCore_Config.MinimapPos
+    }
+    AfterSettingsChanged()
+    if S.rotationBoxFrame and not MageCore_Config.RotationBoxShown then
+        S.rotationBoxFrame:Hide()
+    end
+    Chat("Settings restored to defaults. Saved profiles were kept.")
+end
+
+local function PrintHelp()
+    Chat("commands:")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc|r  open or close the window")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc box on/off|r  rotation monitor")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc profile save/load/delete <name>|r, |cffffffff/mc profile list|r")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc xp on/off/lock/unlock/reset|r  movable XP bar")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc cast on/off/lock/unlock/reset|r  movable cast bar")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc reset|r  restore default settings")
+    DEFAULT_CHAT_FRAME:AddMessage("  |cffffffff/mc debug|r, |cffffffff/mc ampdebug|r, |cffffffff/mc amptest|r, |cffffffff/mc platedebug|r")
+end
+
 local function SlashCommand(message)
-    local command = string.lower(message or "")
-    command = string.gsub(command, "^%s+", "")
-    command = string.gsub(command, "%s+$", "")
-    if command == "box on" then
+    local raw = string.gsub(message or "", "^%s+", "")
+    raw = string.gsub(raw, "%s+$", "")
+    local command = string.lower(raw)
+    local _, _, profileSub, profileName =
+        string.find(raw, "^[Pp][Rr][Oo][Ff][Ii][Ll][Ee][Ss]?%s*(%a*)%s*(.*)$")
+    if profileSub then
+        ProfileCommand(string.lower(profileSub), profileName or "")
+    elseif command == "reset" then
+        Chat("Type |cffffffff/mc reset confirm|r to restore default settings. Saved profiles are kept.")
+    elseif command == "reset confirm" then
+        ResetSettings()
+    elseif command == "cast" or string.find(command, "^cast%s") then
+        CB.Command((string.gsub(command, "^cast%s*", "")))
+    elseif command == "xp" or string.find(command, "^xp%s") then
+        XP.Command((string.gsub(command, "^xp%s*", "")))
+    elseif command == "help" then
+        PrintHelp()
+    elseif command == "box on" then
         SetRotationBoxShown(true)
     elseif command == "box off" then
         SetRotationBoxShown(false)
     elseif command == "box" then
-        LoadDefaults()
+        EnsureConfig()
         SetRotationBoxShown(not MageCore_Config.RotationBoxShown)
     elseif string.find(command, "^box%s") then
-        DEFAULT_CHAT_FRAME:AddMessage(
-            ACCENT .. "[MageCore]|r Use |cffffffff/mc box on|r or "
-                .. "|cffffffff/mc box off|r.")
+        Chat("Use |cffffffff/mc box on|r or |cffffffff/mc box off|r.")
     elseif command == "debug" then
         PrintSpellBookDebug()
+    elseif command == "platedebug" then
+        NP.PrintNameplateDebug()
     elseif command == "ampdebug" then
         PrintAmplifyDebug()
     elseif command == "amptest" then
@@ -3481,16 +4891,564 @@ local function SlashCommand(message)
     end
 end
 
+function UI.MakeDragButton(parent, x, y, label, texture, OnDrag,
+                              tooltipTitle, tooltipLines)
+    local button = CreateFrame("Button", nil, parent)
+    button:SetWidth(48)
+    button:SetHeight(48)
+    button:SetPoint("TOPLEFT", x, y)
+    StyleButton(button)
+    local icon = button:CreateTexture(nil, "OVERLAY")
+    icon:SetPoint("TOPLEFT", 4, -4)
+    icon:SetPoint("BOTTOMRIGHT", -4, 4)
+    icon:SetTexture(texture)
+    button:RegisterForDrag("LeftButton")
+    button:SetScript("OnDragStart", OnDrag)
+    button:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine(tooltipTitle)
+        local _, line
+        for _, line in ipairs(tooltipLines) do
+            GameTooltip:AddLine(line, 0.8, 0.8, 0.8, 1, true)
+        end
+        GameTooltip:Show()
+    end)
+    button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    local text = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("BOTTOM", button, "TOP", 0, 2)
+    text:SetText(label)
+    return icon
+end
+
+function UI.AddHelpText(panel, x, y, text, fontObject)
+    local help = panel:CreateFontString(
+        nil, "OVERLAY", fontObject or "GameFontHighlightSmall")
+    help:SetPoint("TOPLEFT", x, y)
+    help:SetWidth(370)
+    help:SetJustifyH("LEFT")
+    help:SetText(text)
+    return help
+end
+
+function UI.BuildRotationPanel(panel)
+    UI.AddHelpText(panel, 10, 0, "After out-of-combat maintenance, Opener is cast once on a new target. Counterspell and smart elemental wards can take priority.")
+    MageCore_CreateSpellDrop(panel, "Opener:", "Opener", 100, -45)
+    local positions = {
+        { 0, -102 }, { 200, -102 }, { 0, -158 },
+        { 200, -158 }, { 0, -214 }, { 200, -214 }
+    }
+    local i
+    for i = 1, 6 do
+        MageCore_CreateSpellDrop(panel, "Rotation Slot " .. i .. ":",
+            "Rotation" .. i, positions[i][1], positions[i][2])
+    end
+
+    S.rotationIconTexture = UI.MakeDragButton(panel, 18, -272, "Rotation",
+        ICON_PATH .. DEFAULT_ICON,
+        function()
+            local index = CreateOrUpdateMacro(
+                "MageRot", "/script MageCore_Rotate()", GetNextAction())
+            if index and index > 0 then PickupMacro(index) end
+        end,
+        "MageCore Rotation", {
+            "Out of combat: applies configured buffs.",
+            "Maintains targeted Amplify Magic in and out of combat.",
+            "Otherwise, combat presses use the attack rotation.",
+            "Drag onto an action bar."
+        })
+    MageCore_CreateArcaneExplosionDragButton(panel)
+    UI.MakeDragButton(panel, 300, -272, "Guarded Ice Block",
+        GetSpellTextureByName("Ice Block") or ICON_PATH .. "Spell_Frost_Frost",
+        function()
+            local index = CreateOrUpdateMacro(
+                "MageIceBlock", "/script MageCore_IceBlock()", "Ice Block")
+            if index and index > 0 then PickupMacro(index) end
+        end,
+        "Guarded Ice Block", {
+            "Casts Ice Block, then ignores cancellation presses for one second.",
+            "After the guard expires, press the same button to cancel it.",
+            "Drag onto an action bar."
+        })
+end
+
+function UI.BuildBuffPanel(panel)
+    UI.AddHelpText(panel, 10, 0, "Choose one learned armor and up to five other mage buffs. Group Intellect cycles through the roster. Main Rotation maintains Amplify Magic below.")
+    local positions = {
+        { 0, -55 }, { 200, -55 }, { 0, -125 },
+        { 200, -125 }, { 0, -195 }, { 200, -195 }
+    }
+    local i
+    for i = 1, 6 do
+        MageCore_CreateSpellDrop(panel,
+            i == 1 and "Armor:" or "Buff Slot " .. (i - 1) .. ":",
+            "Buff" .. i, positions[i][1], positions[i][2],
+            i == 1 and "armor" or "buff")
+        if i > 1 then
+            UI.MakeCheckBox(panel, "MageCoreBuff" .. i .. "GroupCheck",
+                positions[i][1] + 15, positions[i][2] - 45,
+                "Cast in group", "Buff" .. i .. "Group",
+                function() S.groupBlockedUnits = {} end)
+        end
+    end
+
+    local targetedLabel = panel:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    targetedLabel:SetPoint("TOPLEFT", 15, -263)
+    targetedLabel:SetText(ACCENT .. "Amplify Magic target:|r")
+
+    local drop = CreateFrame(
+        "Frame", "MC_TargetedMagicDrop", panel, "UIDropDownMenuTemplate")
+    drop:SetPoint("TOPLEFT", 0, -278)
+    UIDropDownMenu_SetWidth(185, drop)
+    local function RefreshDrop()
+        UIDropDownMenu_SetSelectedValue(drop,
+            (MageCore_Config.TargetedMagicMode or "TARGET") .. ":"
+                .. (MageCore_Config.TargetedMagicValue or ""))
+        UIDropDownMenu_SetText(GetTargetedMagicDisplay(), drop)
+    end
+    local function Select(mode, value)
+        MageCore_Config.TargetedMagicMode = mode
+        MageCore_Config.TargetedMagicValue = value
+        if mode == "NAME" then MageCore_Config.TargetedMagicSavedName = value end
+        RefreshDrop()
+    end
+    UIDropDownMenu_Initialize(drop, function()
+        local function AddOption(text, mode, value)
+            local info = {}
+            info.text = text
+            info.value = mode .. ":" .. (value or "")
+            info.func = function() Select(mode, value) end
+            UIDropDownMenu_AddButton(info)
+        end
+        AddOption("Current friendly target", "TARGET", nil)
+        AddOption("Self", "SELF", nil)
+        if MageCore_Config.TargetedMagicSavedName then
+            AddOption("Player: " .. MageCore_Config.TargetedMagicSavedName,
+                "NAME", MageCore_Config.TargetedMagicSavedName)
+        end
+        local _, option
+        for _, option in ipairs(MAGE_TARGET_CLASS_OPTIONS) do
+            AddOption("Class: " .. option[2], "CLASS", option[1])
+        end
+    end)
+    RefreshDrop()
+    table.insert(S.menuRefreshers, RefreshDrop)
+
+    local saveButton = CreateFrame("Button", nil, panel)
+    saveButton:SetWidth(165)
+    saveButton:SetHeight(30)
+    saveButton:SetPoint("TOPLEFT", 225, -287)
+    StyleButton(saveButton)
+    local saveText = saveButton:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    saveText:SetPoint("CENTER", 0, 0)
+    saveText:SetText("Save selected player")
+    saveButton:SetScript("OnClick", function()
+        if not IsOtherGroupMember("target") then
+            if UIErrorsFrame then
+                UIErrorsFrame:AddMessage(
+                    "Select a party or raid member first.", 1, 0.1, 0.1, 1)
+            end
+            return
+        end
+        local name = UnitName("target")
+        if not name then return end
+        Select("NAME", name)
+        DEFAULT_CHAT_FRAME:AddMessage(
+            ACCENT .. "[MageCore]|r Amplify Magic target saved: " .. name)
+    end)
+    UI.AddSimpleTooltip(saveButton, "Save selected player",
+        "Remembers the currently selected party or raid member by name.")
+
+    UI.MakeToggleButton(panel, 150, 8, -346, "Auto Buff OOC", "AutoBuff")
+    S.buffIconTexture = UI.MakeDragButton(panel, 176, -338, "Buff only",
+        ICON_PATH .. "Spell_Holy_MagicalSentry",
+        function()
+            local index = CreateOrUpdateMacro(
+                "MageBuff", "/script MageCore_Buff()", GetBuffDisplaySpell())
+            if index and index > 0 then PickupMacro(index) end
+        end,
+        "MageCore Buff", {
+            "Casts the first configured buff that is missing.",
+            "Slots marked Cast in group also check party or raid members.",
+            "Amplify Magic uses your saved player, class, self, or current-target preference.",
+            "Drag onto an action bar for a buff-only button."
+        })
+end
+
+function UI.BuildFoodPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "Food|r")
+    UI.AddHelpText(panel, 18, -48, "Choose Highest or an exact rank. At the minimum, Rotation restocks out of combat until the maximum.")
+
+    local function HighestText(options)
+        local highest = options[1]
+        return highest and highest.rankText
+            and "Highest (" .. highest.rankText .. ")" or "Highest learned"
+    end
+
+    local function MakeConjureDrop(label, kind, x, y)
+        local labelText = panel:CreateFontString(
+            nil, "OVERLAY", "GameFontNormalSmall")
+        labelText:SetPoint("TOPLEFT", x + 15, y)
+        labelText:SetText(ACCENT .. label .. "|r")
+        local dropdown = CreateFrame("Frame", "MC_ConjureDrop_" .. kind,
+            panel, "UIDropDownMenuTemplate")
+        dropdown:SetPoint("TOPLEFT", x, y - 16)
+        UIDropDownMenu_SetWidth(155, dropdown)
+        local function Options()
+            return kind == "Water" and S.knownWaterSpells or S.knownFoodSpells
+        end
+        local function Choose(castName, autoRank, value, text)
+            MageCore_Config[kind .. "Spell"] = castName
+            MageCore_Config[kind .. "AutoRank"] = autoRank
+            MageCore_Config[kind .. "ItemID"] = nil
+            S.conjureRestockActive[kind] = nil
+            S.pendingConjure = nil
+            UIDropDownMenu_SetSelectedValue(dropdown, value)
+            UIDropDownMenu_SetText(text, dropdown)
+        end
+        UIDropDownMenu_Initialize(dropdown, function()
+            local options = Options()
+            local info = {}
+            info.text = "None"
+            info.value = "None"
+            info.func = function() Choose("None", false, "None", "None") end
+            UIDropDownMenu_AddButton(info)
+            local highest = options[1]
+            if highest then
+                local text = HighestText(options)
+                info = {}
+                info.text = text
+                info.value = "AUTO"
+                info.func = function() Choose(highest.cast, true, "AUTO", text) end
+                UIDropDownMenu_AddButton(info)
+            end
+            local _, entry
+            for _, entry in ipairs(options) do
+                local selected = entry
+                info = {}
+                info.text = selected.display
+                info.value = selected.cast
+                info.func = function()
+                    Choose(selected.cast, false, selected.cast, selected.display)
+                end
+                UIDropDownMenu_AddButton(info)
+            end
+        end)
+        local function Refresh()
+            local options = Options()
+            local current = MageCore_Config[kind .. "Spell"] or "None"
+            if MageCore_Config[kind .. "AutoRank"] and options[1] then
+                UIDropDownMenu_SetSelectedValue(dropdown, "AUTO")
+                UIDropDownMenu_SetText(HighestText(options), dropdown)
+                return
+            end
+            local display = "None"
+            local _, entry
+            for _, entry in ipairs(options) do
+                if entry.cast == current then display = entry.display end
+            end
+            UIDropDownMenu_SetSelectedValue(dropdown, current)
+            UIDropDownMenu_SetText(display, dropdown)
+        end
+        Refresh()
+        table.insert(S.menuRefreshers, Refresh)
+    end
+
+    local function MakeThreshold(label, kind, threshold, x, y)
+        UI.MakeNumberBox(panel, "MC_" .. kind .. threshold, x, y - 3, 65, label,
+            kind .. threshold, 0, 999, threshold == "Minimum" and 20 or 80,
+            function(value)
+                -- Keep minimum <= maximum whichever box was edited.
+                local minimum = tonumber(MageCore_Config[kind .. "Minimum"]) or 0
+                local maximum = tonumber(MageCore_Config[kind .. "Maximum"]) or 0
+                if maximum < minimum then
+                    if threshold == "Maximum" then
+                        MageCore_Config[kind .. "Maximum"] = minimum
+                    else
+                        MageCore_Config[kind .. "Maximum"] = value
+                        local other = getglobal("MC_" .. kind .. "Maximum")
+                        if other then other:SetText(value) end
+                    end
+                end
+            end)
+    end
+
+    MakeConjureDrop("Water spell:", "Water", 0, -92)
+    MakeConjureDrop("Food spell:", "Food", 200, -92)
+    MakeThreshold("Minimum water:", "Water", "Minimum", 18, -174)
+    MakeThreshold("Minimum food:", "Food", "Minimum", 218, -174)
+    MakeThreshold("Maximum water:", "Water", "Maximum", 18, -220)
+    MakeThreshold("Maximum food:", "Food", "Maximum", 218, -220)
+
+    S.foodStatusText = UI.AddHelpText(panel, 18, -285,
+        "Select a spell to begin tracking its conjured item.")
+end
+
+function UI.BuildConsumablePanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "Consumable|r")
+    UI.AddHelpText(panel, 18, -48, "Rotation keeps your learned mana gems stocked out of combat and uses the strongest ready gem at or below your configured mana value.")
+    MageCore_CreateManaGemControls(panel)
+    MageCore_CreateDefilersTalismanButton(panel)
+end
+
+function UI.BuildPvPPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "PvP|r")
+    UI.AddHelpText(panel, 18, -40, "PvP Burst and Re-slow only act while PvP Mode is on. Counterspell and Auto Wards work in every fight.")
+
+    UI.MakeToggleButton(panel, 180, 18, -75, "PvP Mode", "PvPMode", "PvP Mode",
+        "With an enemy targeted, skips maintenance, prioritizes your strongest Frostbolt while the target is frozen by Frost Nova, Frostbite, or Freeze, and uses Rank 1 Frostbolt to slow a target that has no chill or freeze (see Re-slow).")
+    UI.MakeToggleButton(panel, 180, 210, -75, "PvP Burst", "PvPBurst",
+        "PvP Burst",
+        "With PvP Mode on and an enemy targeted, Rotation casts Cone of Cold when the target is close enough, then Fire Blast when it is in range, before the PvP Frostbolt logic. Arcane Surge still comes first whenever it procs. After a \"target needs to be in front of you\" error, the burst pauses briefly so Cone of Cold is not wasted while the target is behind you.")
+    UI.MakeToggleButton(panel, 180, 18, -120, "Re-slow", "PvPReslow",
+        "Re-slow",
+        "In PvP Mode, Rotation casts Rank 1 Frostbolt again on the same target once its chill has worn off, at most every 4 seconds. Turn it off to use Rank 1 only once per target.")
+
+    UI.MakeToggleButton(panel, 180, 210, -120, "Players only",
+        "PvPTargetPlayersOnly", "Auto Target: players only",
+        "In PvP Mode, Auto Target cycles through nearby enemies and only picks a living player, skipping NPCs, pets and totems. If no enemy player is near, the target is cleared and nothing is cast. Outside PvP Mode, Auto Target picks the nearest enemy as usual. Auto Target itself is switched on or off on the Extra tab.")
+    UI.MakeToggleButton(panel, 180, 18, -165, "Counterspell", "AutoCounterspell",
+        "Counterspell",
+        "When your current enemy target is casting an interruptible spell, Rotation uses Counterspell before all other actions.")
+    UI.MakeToggleButton(panel, 180, 210, -165, "Healing Only",
+        "CounterspellHealingOnly", "Healing Only",
+        "When Counterspell is enabled, Rotation interrupts recognized healing spells and ignores other casts.")
+
+    UI.MakeToggleButton(panel, 180, 18, -210, "Auto Wards", "AutoFireWard",
+        "Auto Wards",
+        "Enables Fire Ward against configured Fire threats and Frost Ward against hostile Shamans. This works independently of PvP Mode and preserves your selected Fire Ward mode while disabled.")
+
+    local modeButton = CreateFrame("Button", nil, panel)
+    modeButton:SetWidth(180)
+    modeButton:SetHeight(32)
+    modeButton:SetPoint("TOPLEFT", 210, -210)
+    StyleButton(modeButton)
+    local modeText = modeButton:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    modeText:SetPoint("CENTER", 0, 0)
+    local function RefreshMode()
+        modeText:SetText("Ward Mode: "
+            .. (MageCore_Config.FireWardMode == "CLASS"
+                and "Mage/Warlock" or "Smart"))
+    end
+    RefreshMode()
+    table.insert(S.menuRefreshers, RefreshMode)
+    modeButton:SetScript("OnClick", function()
+        if MageCore_Config.FireWardMode == "SMART" then
+            MageCore_Config.FireWardMode = "CLASS"
+        else
+            MageCore_Config.FireWardMode = "SMART"
+        end
+        RefreshMode()
+    end)
+    UI.AddSimpleTooltip(modeButton, "Fire Ward Mode",
+        "Smart uses Fire Ward proactively against Warlocks and remembers enemy Fire casts for two minutes. Mage/Warlock additionally pre-wards against all Mages. Frost Ward is always used against Shamans while Auto Wards is enabled. Counterspell remains the higher priority.")
+
+    UI.MakeDragButton(panel, 18, -280, "R1 Frostbolt",
+        GetSpellTextureByName("Frostbolt") or ICON_PATH .. DEFAULT_ICON,
+        function()
+            local index = CreateOrUpdateMacro("MageSlow",
+                "/script MageCore_SlowFrostbolt()", "Frostbolt")
+            if index and index > 0 then PickupMacro(index) end
+        end,
+        "R1 Frostbolt", {
+            "Always casts Rank 1 Frostbolt on your target - a cheap slow when you chase someone.",
+            "Rotation's PvP logic knows about it and will not repeat it right away.",
+            "Drag onto an action bar."
+        })
+    UI.AddHelpText(panel, 80, -285, "Drag |cffffffffR1 Frostbolt|r to an action bar for a button that always casts Rank 1 Frostbolt on your target.")
+end
+
+function UI.BuildInfoPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "MageCore v" .. VERSION .. "|r")
+    UI.AddHelpText(panel, 18, -48, "Mage rotation and buff helper for Turtle WoW. Open with |cffffffff/mc|r. Spells are read from your mage spellbook.")
+
+    local novaButton = UI.MakeToggleButton(panel, 160, 18, -115, "Nova Range",
+        "FrostNovaRange", nil, nil,
+        function()
+            if not MageCore_Config.FrostNovaRange then
+                NP.HideFrostNovaRangeIndicators()
+            end
+        end)
+    -- This tooltip shows the detected Arctic Reach rank, so build it on hover.
+    novaButton:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Frost Nova Range")
+        GameTooltip:AddLine("Shows a steady red border around hostile nameplates at longer range, then changes to a double-thickness bright green border inside Frost Nova's detected " .. S.frostNovaRangeYards .. "-yard range. Arctic Reach rank " .. S.arcticReachRank .. "/2 is detected from your spellbook. SuperWoW enables range detection for every nameplate; without it, the current target can change to the green state.", 0.8, 0.8, 0.8, 1, true)
+        GameTooltip:Show()
+    end)
+    novaButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local reload = CreateFrame("Button", nil, panel)
+    reload:SetWidth(160)
+    reload:SetHeight(32)
+    reload:SetPoint("TOPLEFT", 18, -225)
+    StyleButton(reload)
+    local reloadText = reload:CreateFontString(
+        nil, "OVERLAY", "GameFontNormalSmall")
+    reloadText:SetPoint("CENTER", 0, 0)
+    reloadText:SetText("Reload UI")
+    reload:SetScript("OnClick", function() ReloadUI() end)
+
+    UI.MakeSlider(panel, "MageCoreNameplateScaleSlider", 205, -230, 50, 150, 5,
+        "NameplateScale", 100, "50%", "150%",
+        function(value)
+            NP.ApplyNameplateScale()
+            return "Nameplate Size: " .. value .. "%"
+        end):SetWidth(160)
+
+    UI.MakeCheckBox(panel, "MageCoreHighlightTargetNameplateCheck", 18, -275,
+        "Target border", "HighlightTargetNameplate",
+        function()
+            NP.ApplyNameplateVisibility()
+            NP.ApplyTargetOnlyNameplateVisibility(true)
+            NP.UpdateTargetNameplateBorder()
+        end,
+        "Target border",
+        "Keeps non-target units in a larger name-only mode and always shows the current target's complete nameplate.")
+    UI.MakeCheckBox(panel, "MageCoreAlwaysShowNameplatesCheck", 205, -275,
+        "Show enemy nameplates", "AlwaysShowNameplates",
+        NP.ApplyNameplateVisibility)
+    UI.MakeCheckBox(panel, "MageCoreShowFriendlyNameplatesCheck", 18, -305,
+        "Show friendly nameplates", "ShowFriendlyNameplates",
+        NP.ApplyNameplateVisibility)
+    UI.MakeCheckBox(panel, "MageCoreTeamNameplateColorsCheck", 205, -305,
+        "Red enemies / green team", "TeamNameplateColors")
+    UI.MakeCheckBox(panel, "MageCoreRaisedNameplatesCheck", 205, -335,
+        "Raised nameplates", "RaisedNameplates", NP.ApplyNameplateScale)
+    UI.MakeCheckBox(panel, "MageCoreNameplateFeaturesCheck", 18, -335,
+        "MageCore nameplate styling", "NameplateFeatures",
+        function()
+            NP.ApplyNameplateVisibility()
+            if not MageCore_Config.NameplateFeatures then
+                NP.UpdateSharpNameplateEdges()
+                NP.UpdateTargetNameplateBorder()
+                DEFAULT_CHAT_FRAME:AddMessage(ACCENT .. "[MageCore]|r Nameplate styling off. Type |cffffffff/reload|r to give the plates fully back to pfUI/ShaguTweaks.")
+            end
+        end,
+        "MageCore nameplate styling",
+        "Size, raise, team colors, edges, target border and name-only mode. Turn it off to let pfUI, ShaguTweaks or the default UI draw the plates on their own (then /reload). Nova Range keeps working either way.")
+    UI.MakeCheckBox(panel, "MageCoreSharpNameplateEdgesCheck", 205, -365,
+        "Sharp nameplate edges", "SharpNameplateEdges",
+        NP.UpdateSharpNameplateEdges)
+end
+
+function UI.GetProfileNamesText()
+    local names = {}
+    local name
+    for name in pairs(MageCore_Config.Profiles or {}) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    if table.getn(names) == 0 then return "none" end
+    return table.concat(names, ", ")
+end
+
+function UI.BuildBarsPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "Bars|r")
+    UI.AddHelpText(panel, 18, -40, "Drag a bar to move it while it is unlocked, then lock it once it sits where you want it.")
+
+    UI.MakeToggleButton(panel, 150, 18, -75, "XP Bar", "XPBarShown",
+        "XP Bar",
+        "Shows a movable experience bar with rested XP. It is hidden automatically at max level.",
+        XP.ApplyConfig)
+    UI.MakeCheckBox(panel, "MageCoreXPBarLockCheck", 185, -79,
+        "Lock XP bar", "XPBarLocked")
+    UI.MakeSlider(panel, "MageCoreXPBarScaleSlider", 28, -130, 50, 200, 5,
+        "XPBarScale", 100, "50%", "200%",
+        function(value)
+            if S.xpBarFrame then BARS.Apply(S.xpBarFrame, "XPBar", -200) end
+            return "XP bar size: " .. value .. "%"
+        end)
+
+    UI.MakeToggleButton(panel, 150, 18, -180, "Cast Bar", "CastBarShown",
+        "Cast Bar",
+        "Shows a movable cast bar with spell icon, name and remaining time. The default cast bar is hidden while this one is on.",
+        CB.ApplyConfig)
+    UI.MakeCheckBox(panel, "MageCoreCastBarLockCheck", 185, -184,
+        "Lock cast bar", "CastBarLocked",
+        function()
+            if S.castBarFrame and MageCore_Config.CastBarShown then
+                CB.ShowState()
+            end
+        end,
+        "Lock cast bar",
+        "While unlocked, the cast bar stays visible as a preview so you can drag it into place.")
+    UI.MakeSlider(panel, "MageCoreCastBarScaleSlider", 28, -235, 50, 200, 5,
+        "CastBarScale", 100, "50%", "200%",
+        function(value)
+            if S.castBarFrame then BARS.Apply(S.castBarFrame, "CastBar", -150) end
+            return "Cast bar size: " .. value .. "%"
+        end)
+
+    UI.AddHelpText(panel, 18, -280,
+        "|cffffffff/mc xp on/off/lock/unlock/reset|r\n"
+        .. "|cffffffff/mc cast on/off/lock/unlock/reset|r\n"
+        .. "Reset moves a bar back to the middle and restores 100% size.")
+end
+
+function UI.BuildExtraPanel(panel)
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 18, -8)
+    title:SetText(ACCENT .. "Extra|r")
+    UI.AddHelpText(panel, 18, -40, "Optional automation for the Rotation button. Each option is off by default except Auto Target.")
+
+    UI.MakeToggleButton(panel, 150, 225, -75, "Surge on proc",
+        "AutoArcaneSurge", "Arcane Surge on proc",
+        "When enabled, the Rotation button casts Arcane Surge as soon as a resist proc is available (also during Arcane Missiles), even if Arcane Surge is not in a Rotation slot. When disabled, Rotation only uses it if a Rotation slot is set to Arcane Surge. The Arcane Explosion button always uses a Surge proc.")
+    UI.MakeToggleButton(panel, 200, 18, -75, "Auto Target", "AutoTargetEnemy",
+        "Auto Target",
+        "When enabled, a Rotation press without a living enemy target selects the nearest enemy. Turn it off to avoid pulling mobs by accident.")
+
+    UI.MakeToggleButton(panel, 200, 18, -125, "Evocation", "AutoEvocation",
+        "Evocation",
+        "In a fight, Rotation channels Evocation when your mana is at or below the selected percentage and no mana gem is ready.")
+    UI.MakeNumberBox(panel, "MageCoreEvocationManaPercent", 240, -119, 60,
+        "At mana %:", "EvocationManaPercent", 1, 100, 10)
+
+    UI.MakeToggleButton(panel, 200, 18, -175, "Low-health Shield",
+        "AutoDefensiveShield", "Low-health Shield",
+        "In combat, Rotation casts Ice Barrier (or Mana Shield when Ice Barrier is unavailable) at or below the selected health percentage. Only one shield is kept at a time.")
+    UI.MakeNumberBox(panel, "MageCoreShieldHealthPercent", 240, -169, 60,
+        "At health %:", "DefensiveShieldHealthPercent", 1, 100, 40)
+
+    local profileTitle = panel:CreateFontString(
+        nil, "OVERLAY", "GameFontNormal")
+    profileTitle:SetPoint("TOPLEFT", 18, -232)
+    profileTitle:SetText(ACCENT .. "Profiles|r")
+    UI.AddHelpText(panel, 18, -252,
+        "|cffffffff/mc profile save <name>|r  saves rotation, buffs and combat toggles\n"
+        .. "|cffffffff/mc profile load <name>|r  restores them\n"
+        .. "|cffffffff/mc profile delete <name>|r,  |cffffffff/mc profile list|r\n"
+        .. "|cffffffff/mc reset|r  restores default settings (profiles are kept)")
+    local saved = UI.AddHelpText(panel, 18, -330, "")
+    local function RefreshSaved()
+        saved:SetText("Saved profiles: |cffffffff" .. UI.GetProfileNamesText() .. "|r")
+    end
+    RefreshSaved()
+    table.insert(S.menuRefreshers, RefreshSaved)
+end
+
 function MageCore_CreateMenu()
     if MageCoreMenuFrame then return end
-    LoadDefaults()
+    EnsureConfig()
     -- Re-scan here as well as at login; some Turtle clients populate class
     -- spellbook tabs after PLAYER_LOGIN has already fired.
     RefreshSpellBook()
 
     local frame = CreateFrame("Frame", "MageCoreMenuFrame", UIParent)
-    MageCoreMenuFrame = frame
-    frame:SetWidth(430)
+    frame:SetWidth(520)
     frame:SetHeight(500)
     frame:SetPoint("CENTER", 0, 0)
     frame:SetFrameStrata("HIGH")
@@ -3515,790 +5473,54 @@ function MageCore_CreateMenu()
     close:SetPoint("TOPRIGHT", -5, -5)
     close:SetScript("OnClick", function() frame:Hide() end)
 
-    local rotationPanel = CreateFrame("Frame", nil, frame)
-    rotationPanel:SetWidth(400); rotationPanel:SetHeight(390)
-    rotationPanel:SetPoint("TOPLEFT", 15, -90)
-    local buffPanel = CreateFrame("Frame", nil, frame)
-    buffPanel:SetWidth(400); buffPanel:SetHeight(390)
-    buffPanel:SetPoint("TOPLEFT", 15, -90)
-    buffPanel:Hide()
-    local foodPanel = CreateFrame("Frame", nil, frame)
-    foodPanel:SetWidth(400); foodPanel:SetHeight(390)
-    foodPanel:SetPoint("TOPLEFT", 15, -90)
-    foodPanel:Hide()
-    local consumablePanel = CreateFrame("Frame", nil, frame)
-    consumablePanel:SetWidth(400); consumablePanel:SetHeight(390)
-    consumablePanel:SetPoint("TOPLEFT", 15, -90)
-    consumablePanel:Hide()
-    local infoPanel = CreateFrame("Frame", nil, frame)
-    infoPanel:SetWidth(400); infoPanel:SetHeight(390)
-    infoPanel:SetPoint("TOPLEFT", 15, -90)
-    infoPanel:Hide()
-
-    local rotationTab, buffTab, foodTab, consumableTab, infoTab
-    local function ShowTab(tab)
-        rotationPanel:Hide(); buffPanel:Hide(); foodPanel:Hide(); consumablePanel:Hide(); infoPanel:Hide()
-        rotationTab:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
-        buffTab:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
-        foodTab:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
-        consumableTab:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
-        infoTab:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
-        if tab == 1 then
-            rotationPanel:Show(); rotationTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-        elseif tab == 2 then
-            buffPanel:Show(); buffTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-        elseif tab == 3 then
-            foodPanel:Show(); foodTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-        elseif tab == 4 then
-            consumablePanel:Show(); consumableTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-        else
-            infoPanel:Show(); infoTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-        end
-    end
-
-    local function MakeTab(text, x, tab)
-        local button = CreateFrame("Button", nil, frame)
-        button:SetWidth(79); button:SetHeight(26); button:SetPoint("TOPLEFT", x, -50)
-        StyleButton(button)
-        local label = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        label:SetPoint("CENTER", 0, 0); label:SetText(text)
-        button:SetScript("OnClick", function() ShowTab(tab) end)
-        return button
-    end
-
-    rotationTab = MakeTab("Rotation", 10, 1)
-    buffTab = MakeTab("Buffs", 92, 2)
-    foodTab = MakeTab("Food", 174, 3)
-    consumableTab = MakeTab("Consumable", 256, 4)
-    infoTab = MakeTab("Info", 338, 5)
-    rotationTab:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
-
-    local rotationHelp = rotationPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    rotationHelp:SetPoint("TOPLEFT", 10, 0); rotationHelp:SetWidth(375); rotationHelp:SetJustifyH("LEFT")
-    rotationHelp:SetText("After out-of-combat maintenance, Opener is cast once on a new target. Counterspell and smart elemental wards can take priority.")
-
-    local buffHelp = buffPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    buffHelp:SetPoint("TOPLEFT", 10, 0); buffHelp:SetWidth(375); buffHelp:SetJustifyH("LEFT")
-    buffHelp:SetText("Choose one learned armor and up to five other mage buffs. Group Intellect cycles through the roster. Main Rotation maintains Amplify Magic below.")
-
-    local foodTitle = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    foodTitle:SetPoint("TOPLEFT", 18, -8)
-    foodTitle:SetText(ACCENT .. "Food|r")
-
-    local foodHelp = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    foodHelp:SetPoint("TOPLEFT", 18, -48)
-    foodHelp:SetWidth(350)
-    foodHelp:SetJustifyH("LEFT")
-    foodHelp:SetText("Choose Highest or an exact rank. At the minimum, Rotation restocks out of combat until the maximum.")
-
-    local function FindConjureDisplay(options, castName)
-        local _, entry
-        for _, entry in ipairs(options) do
-            if entry.cast == castName then return entry.display end
-        end
-        return "None"
-    end
-
-    local function MakeConjureDrop(label, kind, options, x, y)
-        local labelText = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        labelText:SetPoint("TOPLEFT", x + 15, y)
-        labelText:SetText(ACCENT .. label .. "|r")
-        local dropdown = CreateFrame("Frame", "MC_ConjureDrop_" .. kind, foodPanel, "UIDropDownMenuTemplate")
-        dropdown:SetPoint("TOPLEFT", x, y - 16)
-        UIDropDownMenu_SetWidth(155, dropdown)
-        UIDropDownMenu_Initialize(dropdown, function()
-            local menuOptions = kind == "Water" and knownWaterSpells or knownFoodSpells
-            local noneInfo = {}
-            noneInfo.text = "None"; noneInfo.value = "None"
-            noneInfo.func = function()
-                MageCore_Config[kind .. "Spell"] = "None"
-                MageCore_Config[kind .. "AutoRank"] = false
-                MageCore_Config[kind .. "ItemID"] = nil
-                conjureRestockActive[kind] = nil
-                pendingConjure = nil
-                UIDropDownMenu_SetSelectedValue(dropdown, "None")
-                UIDropDownMenu_SetText("None", dropdown)
-            end
-            UIDropDownMenu_AddButton(noneInfo)
-            local highest = menuOptions[1]
-            if highest then
-                local autoInfo = {}
-                autoInfo.text = highest.rankText and "Highest (" .. highest.rankText .. ")" or "Highest learned"
-                autoInfo.value = "AUTO"
-                autoInfo.func = function()
-                    MageCore_Config[kind .. "Spell"] = highest.cast
-                    MageCore_Config[kind .. "AutoRank"] = true
-                    MageCore_Config[kind .. "ItemID"] = nil
-                    conjureRestockActive[kind] = nil
-                    pendingConjure = nil
-                    UIDropDownMenu_SetSelectedValue(dropdown, "AUTO")
-                    UIDropDownMenu_SetText(autoInfo.text, dropdown)
-                end
-                UIDropDownMenu_AddButton(autoInfo)
-            end
-            local _, entry
-            for _, entry in ipairs(menuOptions) do
-                local selected = entry
-                local info = {}
-                info.text = selected.display; info.value = selected.cast
-                info.func = function()
-                    MageCore_Config[kind .. "Spell"] = selected.cast
-                    MageCore_Config[kind .. "AutoRank"] = false
-                    MageCore_Config[kind .. "ItemID"] = nil
-                    conjureRestockActive[kind] = nil
-                    pendingConjure = nil
-                    UIDropDownMenu_SetSelectedValue(dropdown, selected.cast)
-                    UIDropDownMenu_SetText(selected.display, dropdown)
-                end
-                UIDropDownMenu_AddButton(info)
-            end
-        end)
-        local current = MageCore_Config[kind .. "Spell"] or "None"
-        if MageCore_Config[kind .. "AutoRank"] and options[1] then
-            local highestText = options[1].rankText and "Highest (" .. options[1].rankText .. ")" or "Highest learned"
-            UIDropDownMenu_SetSelectedValue(dropdown, "AUTO")
-            UIDropDownMenu_SetText(highestText, dropdown)
-        else
-            UIDropDownMenu_SetSelectedValue(dropdown, current)
-            UIDropDownMenu_SetText(FindConjureDisplay(options, current), dropdown)
-        end
-    end
-
-    local function MakeThresholdBox(label, kind, threshold, x, y)
-        local labelText = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        labelText:SetPoint("TOPLEFT", x, y)
-        labelText:SetText(ACCENT .. label .. "|r")
-        local box = CreateFrame("EditBox", "MC_" .. kind .. threshold, foodPanel)
-        box:SetWidth(65); box:SetHeight(28); box:SetPoint("TOPLEFT", x, y - 20)
-        box:SetNumeric(true); box:SetMaxLetters(3); box:SetAutoFocus(false)
-        box:SetFontObject("GameFontHighlightSmall")
-        StyleButton(box)
-        box:SetText(MageCore_Config[kind .. threshold] or (threshold == "Minimum" and 20 or 80))
-        box:SetTextInsets(8, 8, 0, 0)
-        local function SaveThreshold()
-            local value = tonumber(box:GetText()) or 0
-            value = math.max(0, math.min(999, math.floor(value)))
-            if threshold == "Maximum" then
-                value = math.max(value, tonumber(MageCore_Config[kind .. "Minimum"]) or 0)
-            end
-            MageCore_Config[kind .. threshold] = value
-            if threshold == "Minimum" then
-                local maximum = tonumber(MageCore_Config[kind .. "Maximum"]) or 0
-                if maximum < value then
-                    MageCore_Config[kind .. "Maximum"] = value
-                    local maximumBox = getglobal("MC_" .. kind .. "Maximum")
-                    if maximumBox then maximumBox:SetText(value) end
-                end
-            end
-            box:SetText(value)
-        end
-        box:SetScript("OnEnterPressed", function() SaveThreshold(); this:ClearFocus() end)
-        box:SetScript("OnEditFocusLost", SaveThreshold)
-        box:SetScript("OnEscapePressed", function() this:ClearFocus() end)
-    end
-
-    MakeConjureDrop("Water spell:", "Water", knownWaterSpells, 0, -92)
-    MakeConjureDrop("Food spell:", "Food", knownFoodSpells, 200, -92)
-    MakeThresholdBox("Minimum water:", "Water", "Minimum", 18, -174)
-    MakeThresholdBox("Minimum food:", "Food", "Minimum", 218, -174)
-    MakeThresholdBox("Maximum water:", "Water", "Maximum", 18, -220)
-    MakeThresholdBox("Maximum food:", "Food", "Maximum", 218, -220)
-
-    foodStatusText = foodPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    foodStatusText:SetPoint("TOPLEFT", 18, -285)
-    foodStatusText:SetWidth(350); foodStatusText:SetJustifyH("LEFT")
-    foodStatusText:SetText("Select a spell to begin tracking its conjured item.")
-
-    local consumableTitle = consumablePanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    consumableTitle:SetPoint("TOPLEFT", 18, -8)
-    consumableTitle:SetText(ACCENT .. "Consumable|r")
-
-    local consumableHelp = consumablePanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    consumableHelp:SetPoint("TOPLEFT", 18, -48)
-    consumableHelp:SetWidth(350)
-    consumableHelp:SetJustifyH("LEFT")
-    consumableHelp:SetText("Rotation maintains one Mana Agate out of combat and uses it at 200 mana or below.")
-
-    local manaAgateButton = CreateFrame("Button", nil, consumablePanel)
-    manaAgateButton:SetWidth(190); manaAgateButton:SetHeight(32)
-    manaAgateButton:SetPoint("TOPLEFT", 18, -105)
-    StyleButton(manaAgateButton)
-    local manaAgateText = manaAgateButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    manaAgateText:SetPoint("CENTER", 0, 0)
-    local function UpdateManaAgateText()
-        manaAgateText:SetText("Mana Agate: " .. (MageCore_Config.AutoConjureManaAgate
-            and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateManaAgateText()
-    manaAgateButton:SetScript("OnClick", function()
-        MageCore_Config.AutoConjureManaAgate = not MageCore_Config.AutoConjureManaAgate
-        pendingManaAgate = nil
-        UpdateManaAgateText()
-    end)
-    manaAgateButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Mana Agate")
-        GameTooltip:AddLine("Conjures one when missing and uses it at 200 mana or below.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Conjuring runs out of combat through Rotation.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Both combat buttons can use a ready gem.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    manaAgateButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    MageCore_CreateDefilersTalismanButton(consumablePanel)
-
-    MageCore_CreateSpellDrop(
-        rotationPanel, "Opener:", "Opener", 100, -45)
-
-    local rotationPositions = {
-        { 0, -102 }, { 200, -102 }, { 0, -158 },
-        { 200, -158 }, { 0, -214 }, { 200, -214 }
+    local tabs = {
+        { "Rotation", UI.BuildRotationPanel },
+        { "Buffs", UI.BuildBuffPanel },
+        { "Food", UI.BuildFoodPanel },
+        { "Consumable", UI.BuildConsumablePanel },
+        { "PvP", UI.BuildPvPPanel },
+        { "Info", UI.BuildInfoPanel },
+        { "Bars", UI.BuildBarsPanel },
+        { "Extra", UI.BuildExtraPanel }
     }
-    local buffPositions = {
-        { 0, -55 }, { 200, -55 }, { 0, -125 },
-        { 200, -125 }, { 0, -195 }, { 200, -195 }
-    }
+    local panels = {}
+    local buttons = {}
+    local function ShowTab(index)
+        local i
+        for i = 1, table.getn(panels) do
+            if i == index then
+                panels[i]:Show()
+                buttons[i]:SetBackdropColor(0.08, 0.3, 0.48, 0.96)
+            else
+                panels[i]:Hide()
+                buttons[i]:SetBackdropColor(0.03, 0.09, 0.14, 0.96)
+            end
+        end
+    end
     local i
-    for i = 1, 6 do
-        MageCore_CreateSpellDrop(
-            rotationPanel, "Rotation Slot " .. i .. ":", "Rotation" .. i,
-            rotationPositions[i][1], rotationPositions[i][2])
-        local buffLabel = i == 1
-            and "Armor:" or "Buff Slot " .. (i - 1) .. ":"
-        MageCore_CreateSpellDrop(buffPanel, buffLabel, "Buff" .. i,
-            buffPositions[i][1], buffPositions[i][2],
-            i == 1 and "armor" or "buff")
+    for i = 1, table.getn(tabs) do
+        local panel = CreateFrame("Frame", nil, frame)
+        panel:SetWidth(400)
+        panel:SetHeight(390)
+        panel:SetPoint("TOPLEFT", 15, -90)
+        panels[i] = panel
 
-        if i > 1 then
-            local groupCheck = CreateFrame(
-                "CheckButton", "MageCoreBuff" .. i .. "GroupCheck",
-                buffPanel, "UICheckButtonTemplate")
-            groupCheck:SetWidth(20)
-            groupCheck:SetHeight(20)
-            groupCheck:SetPoint(
-                "TOPLEFT", buffPositions[i][1] + 15,
-                buffPositions[i][2] - 47)
-            groupCheck:SetChecked(
-                MageCore_Config["Buff" .. i .. "Group"] and 1 or nil)
-            local slot = i
-            groupCheck:SetScript("OnClick", function()
-                MageCore_Config["Buff" .. slot .. "Group"] =
-                    this:GetChecked() and true or false
-                groupBlockedUnits = {}
-            end)
+        local tabIndex = i
+        local button = CreateFrame("Button", nil, frame)
+        button:SetWidth(60)
+        button:SetHeight(26)
+        button:SetPoint("TOPLEFT", 14 + (i - 1) * 62, -50)
+        StyleButton(button)
+        local label = button:CreateFontString(
+            nil, "OVERLAY", "GameFontNormalSmall")
+        label:SetPoint("CENTER", 0, 0)
+        label:SetText(tabs[i][1])
+        button:SetScript("OnClick", function() ShowTab(tabIndex) end)
+        buttons[i] = button
 
-            local groupCheckLabel = buffPanel:CreateFontString(
-                nil, "OVERLAY", "GameFontNormalSmall")
-            groupCheckLabel:SetPoint("LEFT", groupCheck, "RIGHT", 2, 0)
-            groupCheckLabel:SetText("Cast in group")
-        end
+        tabs[i][2](panel)
     end
-
-    local targetedMagicLabel = buffPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    targetedMagicLabel:SetPoint("TOPLEFT", 15, -263)
-    targetedMagicLabel:SetText(ACCENT .. "Amplify Magic target:|r")
-
-    local targetedMagicDrop = CreateFrame(
-        "Frame", "MC_TargetedMagicDrop", buffPanel, "UIDropDownMenuTemplate")
-    targetedMagicDrop:SetPoint("TOPLEFT", 0, -278)
-    UIDropDownMenu_SetWidth(185, targetedMagicDrop)
-    local function SetTargetedMagicSelection(mode, value)
-        MageCore_Config.TargetedMagicMode = mode
-        MageCore_Config.TargetedMagicValue = value
-        if mode == "NAME" then
-            MageCore_Config.TargetedMagicSavedName = value
-        end
-        UIDropDownMenu_SetSelectedValue(
-            targetedMagicDrop, mode .. ":" .. (value or ""))
-        UIDropDownMenu_SetText(GetTargetedMagicDisplay(), targetedMagicDrop)
-    end
-    UIDropDownMenu_Initialize(targetedMagicDrop, function()
-        local function AddTargetOption(text, mode, value)
-            local selectedMode, selectedValue = mode, value
-            local info = {}
-            info.text = text
-            info.value = mode .. ":" .. (value or "")
-            info.func = function()
-                SetTargetedMagicSelection(selectedMode, selectedValue)
-            end
-            UIDropDownMenu_AddButton(info)
-        end
-        AddTargetOption("Current friendly target", "TARGET", nil)
-        AddTargetOption("Self", "SELF", nil)
-        if MageCore_Config.TargetedMagicSavedName then
-            AddTargetOption(
-                "Player: " .. MageCore_Config.TargetedMagicSavedName,
-                "NAME", MageCore_Config.TargetedMagicSavedName)
-        end
-        local _, option
-        for _, option in ipairs(MAGE_TARGET_CLASS_OPTIONS) do
-            AddTargetOption("Class: " .. option[2], "CLASS", option[1])
-        end
-    end)
-    UIDropDownMenu_SetSelectedValue(
-        targetedMagicDrop,
-        MageCore_Config.TargetedMagicMode .. ":"
-            .. (MageCore_Config.TargetedMagicValue or ""))
-    UIDropDownMenu_SetText(GetTargetedMagicDisplay(), targetedMagicDrop)
-
-    local saveTargetButton = CreateFrame("Button", nil, buffPanel)
-    saveTargetButton:SetWidth(165)
-    saveTargetButton:SetHeight(30)
-    saveTargetButton:SetPoint("TOPLEFT", 225, -287)
-    StyleButton(saveTargetButton)
-    local saveTargetText = saveTargetButton:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    saveTargetText:SetPoint("CENTER", 0, 0)
-    saveTargetText:SetText("Save selected player")
-    saveTargetButton:SetScript("OnClick", function()
-        if not IsOtherGroupMember("target") then
-            if UIErrorsFrame then
-                UIErrorsFrame:AddMessage(
-                    "Select a party or raid member first.", 1, 0.1, 0.1, 1)
-            end
-            return
-        end
-        local name = UnitName("target")
-        if not name then return end
-        SetTargetedMagicSelection("NAME", name)
-        DEFAULT_CHAT_FRAME:AddMessage(
-            ACCENT .. "[MageCore]|r Amplify Magic target saved: "
-                .. name)
-    end)
-    saveTargetButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Save selected player")
-        GameTooltip:AddLine(
-            "Remembers the currently selected party or raid member by name.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    saveTargetButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    local dragRotation = CreateFrame("Button", nil, rotationPanel)
-    dragRotation:SetWidth(48); dragRotation:SetHeight(48); dragRotation:SetPoint("TOPLEFT", 18, -272)
-    StyleButton(dragRotation)
-    rotationIconTexture = dragRotation:CreateTexture(nil, "OVERLAY")
-    rotationIconTexture:SetPoint("TOPLEFT", 4, -4); rotationIconTexture:SetPoint("BOTTOMRIGHT", -4, 4)
-    rotationIconTexture:SetTexture(ICON_PATH .. DEFAULT_ICON)
-    dragRotation:RegisterForDrag("LeftButton")
-    dragRotation:SetScript("OnDragStart", function()
-        local index = CreateOrUpdateMacro("MageRot", "/script MageCore_Rotate()", GetNextAction())
-        if index and index > 0 then PickupMacro(index) end
-    end)
-    dragRotation:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("MageCore Rotation")
-        GameTooltip:AddLine("Out of combat: applies configured buffs.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Maintains targeted Amplify Magic in and out of combat.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Otherwise, combat presses use the attack rotation.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Drag onto an action bar.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    dragRotation:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    local rotationLabel = rotationPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    rotationLabel:SetPoint("BOTTOM", dragRotation, "TOP", 0, 2)
-    rotationLabel:SetText("Rotation")
-
-    MageCore_CreateArcaneExplosionDragButton(rotationPanel)
-
-    local dragIceBlock = CreateFrame("Button", nil, rotationPanel)
-    dragIceBlock:SetWidth(48)
-    dragIceBlock:SetHeight(48)
-    dragIceBlock:SetPoint("TOPLEFT", 300, -272)
-    StyleButton(dragIceBlock)
-    local iceBlockTexture = dragIceBlock:CreateTexture(nil, "OVERLAY")
-    iceBlockTexture:SetPoint("TOPLEFT", 4, -4)
-    iceBlockTexture:SetPoint("BOTTOMRIGHT", -4, 4)
-    iceBlockTexture:SetTexture(
-        GetSpellTextureByName("Ice Block")
-            or ICON_PATH .. "Spell_Frost_Frost")
-    dragIceBlock:RegisterForDrag("LeftButton")
-    dragIceBlock:SetScript("OnDragStart", function()
-        local index = CreateOrUpdateMacro(
-            "MageIceBlock", "/script MageCore_IceBlock()", "Ice Block")
-        if index and index > 0 then PickupMacro(index) end
-    end)
-    dragIceBlock:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Guarded Ice Block")
-        GameTooltip:AddLine(
-            "Casts Ice Block, then ignores cancellation presses for one second.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine(
-            "After the guard expires, press the same button to cancel it.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine(
-            "Drag onto an action bar.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    dragIceBlock:SetScript(
-        "OnLeave", function() GameTooltip:Hide() end)
-    local iceBlockLabel = rotationPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    iceBlockLabel:SetPoint("BOTTOM", dragIceBlock, "TOP", 0, 2)
-    iceBlockLabel:SetText("Guarded Ice Block")
-
-    local autoFireWardButton = CreateFrame("Button", nil, rotationPanel)
-    autoFireWardButton:SetWidth(180)
-    autoFireWardButton:SetHeight(32)
-    autoFireWardButton:SetPoint("TOPLEFT", 10, -340)
-    StyleButton(autoFireWardButton)
-    local autoFireWardText = autoFireWardButton:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    autoFireWardText:SetPoint("CENTER", 0, 0)
-    local function UpdateAutoFireWardText()
-        autoFireWardText:SetText(
-            "Auto Wards: "
-                .. (MageCore_Config.AutoFireWard
-                    and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateAutoFireWardText()
-    autoFireWardButton:SetScript("OnClick", function()
-        MageCore_Config.AutoFireWard =
-            not MageCore_Config.AutoFireWard
-        UpdateAutoFireWardText()
-    end)
-    autoFireWardButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Auto Wards")
-        GameTooltip:AddLine(
-            "Enables Fire Ward against configured Fire threats and Frost Ward against hostile Shamans. This works independently of PvP Mode and preserves your selected Fire Ward mode while disabled.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    autoFireWardButton:SetScript(
-        "OnLeave", function() GameTooltip:Hide() end)
-
-    local fireWardModeButton = CreateFrame("Button", nil, rotationPanel)
-    fireWardModeButton:SetWidth(180)
-    fireWardModeButton:SetHeight(32)
-    fireWardModeButton:SetPoint("TOPLEFT", 205, -340)
-    StyleButton(fireWardModeButton)
-    local fireWardModeText = fireWardModeButton:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    fireWardModeText:SetPoint("CENTER", 0, 0)
-    local function UpdateFireWardModeText()
-        fireWardModeText:SetText(
-            "Ward Mode: "
-                .. (MageCore_Config.FireWardMode == "CLASS"
-                    and "Mage/Warlock" or "Smart"))
-    end
-    UpdateFireWardModeText()
-    fireWardModeButton:SetScript("OnClick", function()
-        if MageCore_Config.FireWardMode == "SMART" then
-            MageCore_Config.FireWardMode = "CLASS"
-        else
-            MageCore_Config.FireWardMode = "SMART"
-        end
-        UpdateFireWardModeText()
-    end)
-    fireWardModeButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Fire Ward Mode")
-        GameTooltip:AddLine(
-            "Smart uses Fire Ward proactively against Warlocks and remembers enemy Fire casts for two minutes. Mage/Warlock additionally pre-wards against all Mages. Frost Ward is always used against Shamans while Auto Wards is enabled. Counterspell remains the higher priority.",
-            0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    fireWardModeButton:SetScript(
-        "OnLeave", function() GameTooltip:Hide() end)
-
-    local autoButton = CreateFrame("Button", nil, buffPanel)
-    autoButton:SetWidth(150); autoButton:SetHeight(32); autoButton:SetPoint("TOPLEFT", 8, -346)
-    StyleButton(autoButton)
-    local autoText = autoButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    autoText:SetPoint("CENTER", 0, 0)
-    local function UpdateAutoText()
-        autoText:SetText("Auto Buff OOC: " .. (MageCore_Config.AutoBuff and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateAutoText()
-    autoButton:SetScript("OnClick", function()
-        MageCore_Config.AutoBuff = not MageCore_Config.AutoBuff
-        UpdateAutoText()
-    end)
-
-    local dragBuff = CreateFrame("Button", nil, buffPanel)
-    dragBuff:SetWidth(48); dragBuff:SetHeight(48); dragBuff:SetPoint("TOPLEFT", 176, -338)
-    StyleButton(dragBuff)
-    buffIconTexture = dragBuff:CreateTexture(nil, "OVERLAY")
-    buffIconTexture:SetPoint("TOPLEFT", 4, -4); buffIconTexture:SetPoint("BOTTOMRIGHT", -4, 4)
-    buffIconTexture:SetTexture(ICON_PATH .. "Spell_Holy_MagicalSentry")
-    dragBuff:RegisterForDrag("LeftButton")
-    dragBuff:SetScript("OnDragStart", function()
-        local index = CreateOrUpdateMacro("MageBuff", "/script MageCore_Buff()", GetBuffDisplaySpell())
-        if index and index > 0 then PickupMacro(index) end
-    end)
-    dragBuff:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("MageCore Buff")
-        GameTooltip:AddLine("Casts the first configured buff that is missing.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Slots marked Cast in group also check party or raid members.", 0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Amplify Magic uses your saved player, class, self, or current-target preference.", 0.8, 0.8, 0.8, 1, true)
-        GameTooltip:AddLine("Drag onto an action bar for a buff-only button.", 0.8, 0.8, 0.8)
-        GameTooltip:Show()
-    end)
-    dragBuff:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    local buffLabel = buffPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    buffLabel:SetPoint("BOTTOM", dragBuff, "TOP", 0, 2); buffLabel:SetText("Buff only")
-
-    local infoTitle = infoPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    infoTitle:SetPoint("TOPLEFT", 18, -8)
-    infoTitle:SetText(ACCENT .. "MageCore v" .. VERSION .. "|r")
-
-    local infoText = infoPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    infoText:SetPoint("TOPLEFT", 18, -48)
-    infoText:SetWidth(350)
-    infoText:SetJustifyH("LEFT")
-    infoText:SetText("Mage rotation and buff helper for Turtle WoW.\n\nOpen the window with |cffffffff/mc|r or |cffffffff/magecore|r.\n\nSpell choices are read automatically from your mage spellbook.")
-
-    local reloadButton = CreateFrame("Button", nil, infoPanel)
-    reloadButton:SetWidth(160); reloadButton:SetHeight(32)
-    reloadButton:SetPoint("TOPLEFT", 18, -225)
-    StyleButton(reloadButton)
-    local reloadText = reloadButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    reloadText:SetPoint("CENTER", 0, 0); reloadText:SetText("Reload UI")
-    reloadButton:SetScript("OnClick", function() ReloadUI() end)
-
-    local nameplateSlider = CreateFrame("Slider", "MageCoreNameplateScaleSlider", infoPanel, "OptionsSliderTemplate")
-    nameplateSlider:SetWidth(160); nameplateSlider:SetHeight(16)
-    nameplateSlider:SetPoint("TOPLEFT", 205, -230)
-    nameplateSlider:SetMinMaxValues(50, 150)
-    nameplateSlider:SetValueStep(5)
-    nameplateSlider:SetValue(MageCore_Config.NameplateScale or 100)
-    local nameplateSliderLow = getglobal("MageCoreNameplateScaleSliderLow")
-    local nameplateSliderHigh = getglobal("MageCoreNameplateScaleSliderHigh")
-    local nameplateSliderText = getglobal("MageCoreNameplateScaleSliderText")
-    if nameplateSliderLow then nameplateSliderLow:SetText("50%") end
-    if nameplateSliderHigh then nameplateSliderHigh:SetText("150%") end
-    local function UpdateNameplateSliderText()
-        if nameplateSliderText then
-            nameplateSliderText:SetText("Nameplate Size: " .. (MageCore_Config.NameplateScale or 100) .. "%")
-        end
-    end
-    UpdateNameplateSliderText()
-    nameplateSlider:SetScript("OnValueChanged", function()
-        local value = math.floor(this:GetValue() + 0.5)
-        MageCore_Config.NameplateScale = value
-        UpdateNameplateSliderText()
-        ApplyNameplateScale()
-    end)
-
-    local alwaysShowNameplates = CreateFrame(
-        "CheckButton", "MageCoreAlwaysShowNameplatesCheck",
-        infoPanel, "UICheckButtonTemplate")
-    alwaysShowNameplates:SetWidth(24)
-    alwaysShowNameplates:SetHeight(24)
-    alwaysShowNameplates:SetPoint("TOPLEFT", 205, -275)
-    alwaysShowNameplates:SetChecked(
-        MageCore_Config.AlwaysShowNameplates and 1 or nil)
-    alwaysShowNameplates:SetScript("OnClick", function()
-        MageCore_Config.AlwaysShowNameplates =
-            this:GetChecked() and true or false
-        ApplyNameplateVisibility()
-    end)
-
-    local alwaysShowNameplatesLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    alwaysShowNameplatesLabel:SetPoint(
-        "LEFT", alwaysShowNameplates, "RIGHT", 4, 0)
-    alwaysShowNameplatesLabel:SetText(
-        ACCENT .. "Show enemy nameplates|r")
-
-    local showFriendlyNameplates = CreateFrame(
-        "CheckButton", "MageCoreShowFriendlyNameplatesCheck",
-        infoPanel, "UICheckButtonTemplate")
-    showFriendlyNameplates:SetWidth(24)
-    showFriendlyNameplates:SetHeight(24)
-    showFriendlyNameplates:SetPoint("TOPLEFT", 18, -305)
-    showFriendlyNameplates:SetChecked(
-        MageCore_Config.ShowFriendlyNameplates and 1 or nil)
-    showFriendlyNameplates:SetScript("OnClick", function()
-        MageCore_Config.ShowFriendlyNameplates =
-            this:GetChecked() and true or false
-        ApplyNameplateVisibility()
-    end)
-
-    local showFriendlyNameplatesLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    showFriendlyNameplatesLabel:SetPoint(
-        "LEFT", showFriendlyNameplates, "RIGHT", 4, 0)
-    showFriendlyNameplatesLabel:SetText(
-        ACCENT .. "Show friendly nameplates|r")
-
-    local teamNameplateColors = CreateFrame(
-        "CheckButton", "MageCoreTeamNameplateColorsCheck",
-        infoPanel, "UICheckButtonTemplate")
-    teamNameplateColors:SetWidth(24)
-    teamNameplateColors:SetHeight(24)
-    teamNameplateColors:SetPoint("TOPLEFT", 205, -305)
-    teamNameplateColors:SetChecked(
-        MageCore_Config.TeamNameplateColors and 1 or nil)
-    teamNameplateColors:SetScript("OnClick", function()
-        MageCore_Config.TeamNameplateColors =
-            this:GetChecked() and true or false
-    end)
-
-    local teamNameplateColorsLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    teamNameplateColorsLabel:SetPoint(
-        "LEFT", teamNameplateColors, "RIGHT", 4, 0)
-    teamNameplateColorsLabel:SetText(
-        ACCENT .. "Red enemies / green team|r")
-
-    local raisedNameplates = CreateFrame(
-        "CheckButton", "MageCoreRaisedNameplatesCheck",
-        infoPanel, "UICheckButtonTemplate")
-    raisedNameplates:SetWidth(24)
-    raisedNameplates:SetHeight(24)
-    raisedNameplates:SetPoint("TOPLEFT", 205, -335)
-    raisedNameplates:SetChecked(
-        MageCore_Config.RaisedNameplates and 1 or nil)
-    raisedNameplates:SetScript("OnClick", function()
-        MageCore_Config.RaisedNameplates =
-            this:GetChecked() and true or false
-        ApplyNameplateScale()
-    end)
-
-    local raisedNameplatesLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    raisedNameplatesLabel:SetPoint(
-        "LEFT", raisedNameplates, "RIGHT", 4, 0)
-    raisedNameplatesLabel:SetText(
-        ACCENT .. "Raised nameplates|r")
-
-    local sharpNameplateEdges = CreateFrame(
-        "CheckButton", "MageCoreSharpNameplateEdgesCheck",
-        infoPanel, "UICheckButtonTemplate")
-    sharpNameplateEdges:SetWidth(24)
-    sharpNameplateEdges:SetHeight(24)
-    sharpNameplateEdges:SetPoint("TOPLEFT", 205, -365)
-    sharpNameplateEdges:SetChecked(
-        MageCore_Config.SharpNameplateEdges and 1 or nil)
-    sharpNameplateEdges:SetScript("OnClick", function()
-        MageCore_Config.SharpNameplateEdges =
-            this:GetChecked() and true or false
-        UpdateSharpNameplateEdges()
-    end)
-
-    local sharpNameplateEdgesLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    sharpNameplateEdgesLabel:SetPoint(
-        "LEFT", sharpNameplateEdges, "RIGHT", 4, 0)
-    sharpNameplateEdgesLabel:SetText(
-        ACCENT .. "Sharp nameplate edges|r")
-
-    local highlightTargetNameplate = CreateFrame(
-        "CheckButton", "MageCoreHighlightTargetNameplateCheck",
-        infoPanel, "UICheckButtonTemplate")
-    highlightTargetNameplate:SetWidth(24)
-    highlightTargetNameplate:SetHeight(24)
-    highlightTargetNameplate:SetPoint("TOPLEFT", 18, -275)
-    highlightTargetNameplate:SetChecked(
-        MageCore_Config.HighlightTargetNameplate and 1 or nil)
-    highlightTargetNameplate:SetScript("OnClick", function()
-        MageCore_Config.HighlightTargetNameplate =
-            this:GetChecked() and true or false
-        UpdateTargetNameplateBorder()
-    end)
-
-    local highlightTargetNameplateLabel = infoPanel:CreateFontString(
-        nil, "OVERLAY", "GameFontNormalSmall")
-    highlightTargetNameplateLabel:SetPoint(
-        "LEFT", highlightTargetNameplate, "RIGHT", 4, 0)
-    highlightTargetNameplateLabel:SetText(
-        ACCENT .. "White target border|r")
-
-    local pvpButton = CreateFrame("Button", nil, infoPanel)
-    pvpButton:SetWidth(160); pvpButton:SetHeight(32)
-    pvpButton:SetPoint("TOPLEFT", 18, -170)
-    StyleButton(pvpButton)
-    local pvpText = pvpButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    pvpText:SetPoint("CENTER", 0, 0)
-    local function UpdatePvpText()
-        pvpText:SetText("PvP Mode: " .. (MageCore_Config.PvPMode and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdatePvpText()
-    pvpButton:SetScript("OnClick", function()
-        MageCore_Config.PvPMode = not MageCore_Config.PvPMode
-        UpdatePvpText()
-    end)
-    pvpButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("PvP Mode")
-        GameTooltip:AddLine("With an enemy targeted, skips maintenance and uses Rank 1 Frostbolt once per newly acquired target when the enemy is not already slowed by a frost effect.", 0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    pvpButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    local novaRangeButton = CreateFrame("Button", nil, infoPanel)
-    novaRangeButton:SetWidth(160); novaRangeButton:SetHeight(32)
-    novaRangeButton:SetPoint("TOPLEFT", 205, -170)
-    StyleButton(novaRangeButton)
-    local novaRangeText = novaRangeButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    novaRangeText:SetPoint("CENTER", 0, 0)
-    local function UpdateNovaRangeText()
-        novaRangeText:SetText("Nova Range: " .. (MageCore_Config.FrostNovaRange and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateNovaRangeText()
-    novaRangeButton:SetScript("OnClick", function()
-        MageCore_Config.FrostNovaRange = not MageCore_Config.FrostNovaRange
-        if not MageCore_Config.FrostNovaRange then HideFrostNovaRangeIndicators() end
-        UpdateNovaRangeText()
-    end)
-    novaRangeButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Frost Nova Range")
-        GameTooltip:AddLine("Shows a steady red border around hostile nameplates at longer range, then changes to a double-thickness bright green border inside Frost Nova's detected " .. frostNovaRangeYards .. "-yard range. Arctic Reach rank " .. arcticReachRank .. "/2 is detected from your spellbook. SuperWoW enables range detection for every nameplate; without it, the current target can change to the green state.", 0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    novaRangeButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    local counterspellButton = CreateFrame("Button", nil, infoPanel)
-    counterspellButton:SetWidth(160); counterspellButton:SetHeight(32)
-    counterspellButton:SetPoint("TOPLEFT", 18, -115)
-    StyleButton(counterspellButton)
-    local counterspellText = counterspellButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    counterspellText:SetPoint("CENTER", 0, 0)
-    local function UpdateCounterspellText()
-        counterspellText:SetText("Counterspell: " .. (MageCore_Config.AutoCounterspell and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateCounterspellText()
-    counterspellButton:SetScript("OnClick", function()
-        MageCore_Config.AutoCounterspell = not MageCore_Config.AutoCounterspell
-        UpdateCounterspellText()
-    end)
-    counterspellButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Counterspell")
-        GameTooltip:AddLine("When your current enemy target is casting an interruptible spell, Rotation uses Counterspell before all other actions.", 0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    counterspellButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-    local healingOnlyButton = CreateFrame("Button", nil, infoPanel)
-    healingOnlyButton:SetWidth(160); healingOnlyButton:SetHeight(32)
-    healingOnlyButton:SetPoint("TOPLEFT", 205, -115)
-    StyleButton(healingOnlyButton)
-    local healingOnlyText = healingOnlyButton:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    healingOnlyText:SetPoint("CENTER", 0, 0)
-    local function UpdateHealingOnlyText()
-        healingOnlyText:SetText("Healing Only: " .. (MageCore_Config.CounterspellHealingOnly and "|cff00ff00ON|r" or "|cffff4444OFF|r"))
-    end
-    UpdateHealingOnlyText()
-    healingOnlyButton:SetScript("OnClick", function()
-        MageCore_Config.CounterspellHealingOnly = not MageCore_Config.CounterspellHealingOnly
-        UpdateHealingOnlyText()
-    end)
-    healingOnlyButton:SetScript("OnEnter", function()
-        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Healing Only")
-        GameTooltip:AddLine("When Counterspell is enabled, Rotation interrupts recognized healing spells and ignores other casts.", 0.8, 0.8, 0.8, 1, true)
-        GameTooltip:Show()
-    end)
-    healingOnlyButton:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
+    ShowTab(1)
     frame:Show()
 end
 
@@ -4314,6 +5536,14 @@ local function GetRestedXPString()
     local percent = math.floor(100 * restedXP / levelXP)
     if percent >= 112 then return "MAX" end
     return percent .. "%"
+end
+
+local function GetCurrentXPString()
+    local currentXP = UnitXP("player") or 0
+    local levelXP = UnitXPMax("player") or 0
+    if levelXP <= 0 then return currentXP end
+    local percent = math.floor(100 * currentXP / levelXP)
+    return currentXP .. " / " .. levelXP .. " (" .. percent .. "%)"
 end
 
 function MageCore_Minimap_UpdatePosition()
@@ -4357,6 +5587,7 @@ local function CreateMinimapButton()
     button:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_LEFT")
         GameTooltip:AddLine(ACCENT .. "MageCore v" .. VERSION .. "|r")
+        GameTooltip:AddLine("Current XP: |cff00ff00" .. GetCurrentXPString() .. "|r", 1, 1, 1)
         GameTooltip:AddLine("Currently |cff00ff00" .. GetRestedXPString() .. "|r Rested", 1, 1, 1)
         GameTooltip:AddLine("Left-click to open", 0.8, 0.8, 0.8)
         GameTooltip:AddLine("Drag to move", 0.8, 0.8, 0.8)
@@ -4387,14 +5618,19 @@ eventFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
 eventFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 eventFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
+eventFrame:RegisterEvent("UNIT_AURA")
+eventFrame:RegisterEvent("PLAYER_AURAS_CHANGED")
+eventFrame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
 eventFrame:SetScript("OnEvent", function()
     if event == "VARIABLES_LOADED" then
         LoadDefaults()
     elseif event == "PLAYER_LOGIN" then
         LoadDefaults(); RefreshSpellBook(); CreateMinimapButton(); SetupRotationButtonTooltips()
+        XP.ApplyConfig()
+        CB.ApplyConfig()
         if MageCore_Config.RotationBoxShown then
             CreateRotationBox()
-            rotationBoxFrame:Show()
+            S.rotationBoxFrame:Show()
             UpdateRotationBox()
         end
         SLASH_MAGECORE1 = "/mc"
@@ -4404,63 +5640,76 @@ eventFrame:SetScript("OnEvent", function()
     elseif event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB" then
         RefreshSpellBook()
     elseif event == "START_AUTOREPEAT_SPELL" then
-        autoRepeatActive = true
+        S.autoRepeatActive = true
     elseif event == "STOP_AUTOREPEAT_SPELL" then
-        autoRepeatActive = false
+        S.autoRepeatActive = false
     elseif event == "BAG_UPDATE" then
+        S.bagSnapshot = nil
         LearnPendingConjureItem()
-        if pendingManaAgate and FindBagItemByName("Mana Agate") then pendingManaAgate = nil end
+        if S.pendingManaGem and FindBagItemByName(S.pendingManaGem.item) then
+            S.pendingManaGem = nil
+        end
     elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
-        normalCastInProgress = false
-        channelInProgress = false
-        channelSpellName = nil
-        pendingConjure = nil
-        pendingManaAgate = nil
-        if lastCombatSpellAttempt and lastCombatSpellAttempt.opener
-            and GetTime() - lastCombatSpellAttempt.time < 1.5 then
-            openerUsedForTarget = nil
+        S.normalCastInProgress = false
+        S.channelInProgress = false
+        S.channelSpellName = nil
+        S.pendingConjure = nil
+        S.pendingManaGem = nil
+        if S.lastCombatSpellAttempt and S.lastCombatSpellAttempt.opener
+            and GetTime() - S.lastCombatSpellAttempt.time < 1.5 then
+            S.openerUsedForTarget = nil
         end
     elseif event == "SPELLCAST_START" then
-        normalCastInProgress = true
+        S.normalCastInProgress = true
     elseif event == "SPELLCAST_STOP" then
-        normalCastInProgress = false
+        S.normalCastInProgress = false
     elseif event == "SPELLCAST_CHANNEL_START" then
-        normalCastInProgress = false
-        channelInProgress = true
-        channelSpellName = arg2
-        if not channelSpellName and lastCombatSpellAttempt
-            and GetTime() - lastCombatSpellAttempt.time < 1.5 then
-            channelSpellName = lastCombatSpellAttempt.spell
+        S.normalCastInProgress = false
+        S.channelInProgress = true
+        S.channelSpellName = arg2
+        if not S.channelSpellName and S.lastCombatSpellAttempt
+            and GetTime() - S.lastCombatSpellAttempt.time < 1.5 then
+            S.channelSpellName = S.lastCombatSpellAttempt.spell
         end
     elseif event == "SPELLCAST_CHANNEL_STOP" then
-        normalCastInProgress = false
-        channelInProgress = false
-        channelSpellName = nil
+        S.normalCastInProgress = false
+        S.channelInProgress = false
+        S.channelSpellName = nil
     elseif event == "UI_ERROR_MESSAGE" then
         local message = string.lower(arg1 or "")
         local notEnoughMana =
             (SPELL_FAILED_NO_POWER and arg1 == SPELL_FAILED_NO_POWER)
             or string.find(message, "not enough mana", 1, true)
-        if notEnoughMana and lastCombatSpellAttempt
-            and GetTime() - lastCombatSpellAttempt.time < 1.5 then
+        if notEnoughMana and S.lastCombatSpellAttempt
+            and GetTime() - S.lastCombatSpellAttempt.time < 1.5 then
             -- Some Vanilla clients fail to expose mana costs or the
             -- IsUsableSpell power flag for particular Turtle spells. Force
             -- the next Rotation press through the wand fallback.
-            lowManaWandFallbackUntil = GetTime() + 3
+            S.lowManaWandFallbackUntil = GetTime() + 3
+        end
+        local notInFront = (SPELL_FAILED_UNIT_NOT_INFRONT
+                and arg1 == SPELL_FAILED_UNIT_NOT_INFRONT)
+            or string.find(message, "in front of you", 1, true)
+        if notInFront and S.lastCombatSpellAttempt
+            and GetTime() - S.lastCombatSpellAttempt.time < 1.5 then
+            S.facingBlocked = {
+                target = S.lastCombatSpellAttempt.target,
+                expires = GetTime() + 1.5
+            }
         end
         local outOfRange = (SPELL_FAILED_OUT_OF_RANGE and arg1 == SPELL_FAILED_OUT_OF_RANGE)
             or string.find(message, "out of range", 1, true)
             or string.find(message, "too far away", 1, true)
             or string.find(message, "line of sight", 1, true)
-        if outOfRange and lastGroupBuffAttempt
-            and GetTime() - lastGroupBuffAttempt.time < 1.5 then
-            groupBlockedUnits[lastGroupBuffAttempt.key] = GetTime() + 5
-            lastGroupBuffAttempt = nil
-        elseif outOfRange and lastCombatSpellAttempt
-            and GetTime() - lastCombatSpellAttempt.time < 1.5 then
-            if lastCombatSpellAttempt.opener then openerUsedForTarget = nil end
-            rangeBlockedSpells[lastCombatSpellAttempt.spell] = {
-                target = lastCombatSpellAttempt.target,
+        if outOfRange and S.lastGroupBuffAttempt
+            and GetTime() - S.lastGroupBuffAttempt.time < 1.5 then
+            S.groupBlockedUnits[S.lastGroupBuffAttempt.key] = GetTime() + 5
+            S.lastGroupBuffAttempt = nil
+        elseif outOfRange and S.lastCombatSpellAttempt
+            and GetTime() - S.lastCombatSpellAttempt.time < 1.5 then
+            if S.lastCombatSpellAttempt.opener then S.openerUsedForTarget = nil end
+            S.rangeBlockedSpells[S.lastCombatSpellAttempt.spell] = {
+                target = S.lastCombatSpellAttempt.target,
                 expires = GetTime() + 2.5
             }
         end
@@ -4471,95 +5720,128 @@ eventFrame:SetScript("OnEvent", function()
         if string.find(arg1 or "", "^You interrupt ", 1) then
             -- Repeat once on the next update in case Luna's event handler runs
             -- after MageCore's handler and redraws its cached cast.
-            pendingLunaInterruptMessage = arg1
+            S.pendingLunaInterruptMessage = arg1
         end
         if event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
             TrackArcaneSurgeFromCombatMessage(arg1)
         end
     elseif event == "PLAYER_TARGET_CHANGED" then
-        rangeBlockedSpells = {}
-        lastCombatSpellAttempt = nil
-        openerUsedForTarget = nil
-        pvpFrostboltUsedForTarget = nil
+        InvalidateAuraCache("target")
+        if GetTime() > (S.suppressTargetResetUntil or 0) then
+            S.rangeBlockedSpells = {}
+            S.lastCombatSpellAttempt = nil
+            S.openerUsedForTarget = nil
+            S.pvpFrostboltUsedForTarget = nil
+            S.facingBlocked = nil
+        end
+        NP.ApplyNameplateVisibility()
+        NP.ApplyTargetOnlyNameplateVisibility(true)
     elseif event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
-        groupBlockedUnits = {}
-        lastGroupBuffAttempt = nil
+        S.groupBlockedUnits = {}
+        S.lastGroupBuffAttempt = nil
+        InvalidateAuraCache()
+    elseif event == "UNIT_AURA" then
+        InvalidateAuraCache(arg1)
+    elseif event == "PLAYER_AURAS_CHANGED" then
+        InvalidateAuraCache("player")
+    elseif event == "ACTIONBAR_SLOT_CHANGED" then
+        S.actionSlotIndex = nil
     end
 end)
 
-eventFrame:SetScript("OnUpdate", function()
-    if pendingLunaInterruptMessage then
-        ClearConfirmedLunaInterrupt(pendingLunaInterruptMessage)
-        pendingLunaInterruptMessage = nil
-    end
-
-    frostNovaRangeElapsed = frostNovaRangeElapsed + (arg1 or 0)
-    if frostNovaRangeElapsed >= 0.1 then
-        frostNovaRangeElapsed = 0
-        UpdateFrostNovaRangeIndicators()
-    end
-
-    updateElapsed = updateElapsed + (arg1 or 0)
-    if updateElapsed < 0.4 then return end
-    updateElapsed = 0
-    if not MageCore_Config then return end
-    ApplyNameplateVisibility()
-    UpdateRotationBox()
-    UpdateIceBlockCooldown()
-    if pendingConjure then LearnPendingConjureItem() end
-
-    if foodStatusText then
-        local waterSpell = MageCore_Config.WaterSpell or "None"
-        local foodSpell = MageCore_Config.FoodSpell or "None"
-        local waterState = "disabled"
-        local foodState = "disabled"
-        if waterSpell ~= "None" then
-            if MageCore_Config.WaterItemID then
-                waterState = GetItemCountByID(MageCore_Config.WaterItemID)
-                    .. " (min " .. (MageCore_Config.WaterMinimum or 0)
-                    .. ", max " .. (MageCore_Config.WaterMaximum or 0) .. ")"
+local function UpdateFoodStatus()
+    -- Counting bag contents is only needed while the Food tab is visible.
+    if not S.foodStatusText or not S.foodStatusText:IsVisible() then return end
+    local lines = {}
+    local _, kind
+    for _, kind in ipairs({ "Water", "Food" }) do
+        local state = "disabled"
+        if (MageCore_Config[kind .. "Spell"] or "None") ~= "None" then
+            local itemID = MageCore_Config[kind .. "ItemID"]
+            if itemID then
+                state = GetItemCountByID(itemID)
+                    .. " (min " .. (MageCore_Config[kind .. "Minimum"] or 0)
+                    .. ", max " .. (MageCore_Config[kind .. "Maximum"] or 0) .. ")"
             else
-                waterState = "learns item on first conjure"
+                state = "learns item on first conjure"
             end
         end
-        if foodSpell ~= "None" then
-            if MageCore_Config.FoodItemID then
-                foodState = GetItemCountByID(MageCore_Config.FoodItemID)
-                    .. " (min " .. (MageCore_Config.FoodMinimum or 0)
-                    .. ", max " .. (MageCore_Config.FoodMaximum or 0) .. ")"
-            else
-                foodState = "learns item on first conjure"
-            end
-        end
-        foodStatusText:SetText("Water: " .. waterState .. "\nFood: " .. foodState)
+        table.insert(lines, kind .. ": " .. state)
     end
+    S.foodStatusText:SetText(table.concat(lines, "\n"))
+end
 
-    local channelAction = channelInProgress
-        and channelSpellName == "Arcane Missiles"
-        and GetArcaneSurgeAction()
-    if not normalCastInProgress and (not channelInProgress or channelAction) then
-        local nextAction = channelAction or GetNextAction()
-        local rotationTexture = GetSpellTextureByName(nextAction) or ICON_PATH .. DEFAULT_ICON
-        if rotationIconTexture then rotationIconTexture:SetTexture(rotationTexture) end
-        local rotationMacroIcon = TextureName(rotationTexture) or DEFAULT_ICON
-        if rotationMacroIcon ~= lastRotationIcon then
-            local index = GetMacroIndex("MageRot", false)
-            if index > 0 then EditMacro(index, "MageRot", rotationMacroIcon, "/script MageCore_Rotate()", nil, nil) end
-            lastRotationIcon = rotationMacroIcon
-        end
-        UpdateRotationCooldown(nextAction)
-        UpdateRotationManaState(nextAction)
+local function UpdateRotationButton()
+    local decision = DecideRotation(false)
+    S.lastDecision = decision
+    -- The icon stays locked to the active cast or channel, unless the next
+    -- press would interrupt it (emergency potion or Arcane Surge).
+    if S.normalCastInProgress or S.channelInProgress then
+        local urgent = decision and (decision.kind == "POTION"
+            or decision.kind == "SURGE_INTERRUPT" or decision.tag == "SURGE")
+        if not urgent then return end
     end
+    local spellName = decision and decision.spell
+    local texture = GetDecisionTexture(decision) or ICON_PATH .. DEFAULT_ICON
+    SetRotationIconTexture(texture)
+    local macroIcon = TextureName(texture) or DEFAULT_ICON
+    if macroIcon ~= S.lastRotationIcon then
+        local index = GetMacroIndex("MageRot", false)
+        if index > 0 then
+            EditMacro(index, "MageRot", macroIcon,
+                "/script MageCore_Rotate()", nil, nil)
+        end
+        S.lastRotationIcon = macroIcon
+    end
+    UpdateRotationCooldown(spellName)
+    UpdateRotationManaState(spellName)
+end
 
-    MageCore_UpdateArcaneExplosionButton()
-
-    local nextBuff = GetBuffDisplaySpell()
-    local buffTexture = GetSpellTextureByName(nextBuff) or ICON_PATH .. "Spell_Holy_MagicalSentry"
-    if buffIconTexture then buffIconTexture:SetTexture(buffTexture) end
+local function UpdateBuffButton()
+    -- Checking buffs walks the whole party or raid, so skip it when neither
+    -- the Buff tab icon nor a placed MageBuff macro would show the result.
+    local iconVisible = S.buffIconTexture and S.buffIconTexture:IsVisible()
+    local macroIndex = GetMacroIndex("MageBuff", false)
+    if not iconVisible and macroIndex == 0 then return end
+    local buffTexture = GetSpellTextureByName(GetBuffDisplaySpell())
+        or ICON_PATH .. "Spell_Holy_MagicalSentry"
+    if S.buffIconTexture then S.buffIconTexture:SetTexture(buffTexture) end
     local buffMacroIcon = TextureName(buffTexture) or "Spell_Holy_MagicalSentry"
-    if buffMacroIcon ~= lastBuffIcon then
-        local index = GetMacroIndex("MageBuff", false)
-        if index > 0 then EditMacro(index, "MageBuff", buffMacroIcon, "/script MageCore_Buff()", nil, nil) end
-        lastBuffIcon = buffMacroIcon
+    if buffMacroIcon ~= S.lastBuffIcon and macroIndex > 0 then
+        EditMacro(macroIndex, "MageBuff", buffMacroIcon,
+            "/script MageCore_Buff()", nil, nil)
+        S.lastBuffIcon = buffMacroIcon
+    end
+end
+
+eventFrame:SetScript("OnUpdate", function()
+    if S.pendingLunaInterruptMessage then
+        ClearConfirmedLunaInterrupt(S.pendingLunaInterruptMessage)
+        S.pendingLunaInterruptMessage = nil
+    end
+
+    local elapsed = arg1 or 0
+    S.frostNovaRangeElapsed = S.frostNovaRangeElapsed + elapsed
+    if S.frostNovaRangeElapsed >= 0.1 then
+        S.frostNovaRangeElapsed = 0
+        NP.UpdateFrostNovaRangeIndicators()
+    end
+
+    S.buffElapsed = S.buffElapsed + elapsed
+    S.updateElapsed = S.updateElapsed + elapsed
+    if S.updateElapsed < 0.4 then return end
+    S.updateElapsed = 0
+    if not MageCore_Config then return end
+    EnsureConfig()
+    NP.ApplyNameplateVisibility()
+    UpdateIceBlockCooldown()
+    if S.pendingConjure then LearnPendingConjureItem() end
+    UpdateFoodStatus()
+    UpdateRotationButton()
+    UpdateRotationBox()
+    MageCore_UpdateArcaneExplosionButton()
+    if S.buffElapsed >= 1 then
+        S.buffElapsed = 0
+        UpdateBuffButton()
     end
 end)
